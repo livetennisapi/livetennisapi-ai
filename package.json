@@ -1,0 +1,81 @@
+{
+  "name": "livetennisapi-ai",
+  "version": "1.0.0",
+  "description": "Live Tennis API as Vercel AI SDK tools — give any AI SDK model real-time tennis scores, players, fixtures, market prices and model win-probability.",
+  "keywords": [
+    "ai",
+    "ai-sdk",
+    "vercel-ai-sdk",
+    "ai-sdk-tools",
+    "tool",
+    "tools",
+    "llm",
+    "ai-agent",
+    "tool-calling",
+    "generate-text",
+    "tennis",
+    "tennis-api",
+    "live-scores",
+    "sports",
+    "sports-api",
+    "sports-data",
+    "atp",
+    "wta"
+  ],
+  "homepage": "https://livetennisapi.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/livetennisapi/livetennisapi-ai.git"
+  },
+  "bugs": {
+    "url": "https://github.com/livetennisapi/livetennisapi-ai/issues"
+  },
+  "license": "MIT",
+  "author": "Live Tennis API",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node test/tools-output.mjs && node test/generate-text.mjs",
+    "test:tools": "node test/tools-output.mjs",
+    "test:generate": "node test/generate-text.mjs",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "livetennisapi": "^1.0.2",
+    "zod": "^3.25.76"
+  },
+  "peerDependencies": {
+    "ai": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ai": "^7.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}
