@@ -21,6 +21,7 @@
  * Run: node test/tools-output.mjs        (no credentials, no network)
  */
 
+import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
 import { createServer } from 'node:http';
 
@@ -134,21 +135,57 @@ async function main() {
     fail(`tool set differs from expected — missing: [${missing}] unexpected: [${extra}]`);
   }
 
-  // Cross-check against the MCP server's own source when the sibling package is
-  // checked out next to this one. Optional by design: this package is published
-  // standalone, and a missing sibling must not fail the suite.
-  const mcpSource = new URL('../../livetennisapi-mcp/src/server.ts', import.meta.url).pathname;
-  if (existsSync(mcpSource)) {
-    const mcpNames = [...readFileSync(mcpSource, 'utf8').matchAll(/registerTool\(\s*'([a-z_]+)'/g)].map((m) => m[1]);
-    if (mcpNames.length !== 12) fail(`parsed ${mcpNames.length} tools from the MCP server, expected 12`);
-    const drift = [
-      ...mcpNames.filter((t) => !names.includes(t)).map((t) => `only in MCP: ${t}`),
-      ...names.filter((t) => !mcpNames.includes(t)).map((t) => `only here: ${t}`),
-    ];
-    if (drift.length) fail(`tool names have drifted from the MCP server — ${drift.join(', ')}`);
-    console.log('  cross-checked 12 tool names against livetennisapi-mcp/src/server.ts');
+  // Parity with the MCP server — the real invariant, not just tool names.
+  //
+  // These are two copies of the same 12 tools. A description improved in one and
+  // not the other is the drift that actually costs users, and it is invisible to
+  // a name-only check. So compare against what the MCP server ACTUALLY
+  // advertises over the protocol, rather than regexing its source: source
+  // parsing breaks silently when the formatting changes, and a check that
+  // quietly stops checking is worse than no check.
+  //
+  // Optional by design — this package publishes standalone, so a missing or
+  // unbuilt sibling must not fail the suite. But it says so out loud.
+  const mcpEntry = new URL('../../livetennisapi-mcp/dist/index.js', import.meta.url).pathname;
+  if (existsSync(mcpEntry)) {
+    const mcp = spawn('node', [mcpEntry], { stdio: ['pipe', 'pipe', 'ignore'] });
+    const say = (o) => mcp.stdin.write(JSON.stringify(o) + '\n');
+    const replies = new Map();
+    let buf = '';
+    mcp.stdout.on('data', (d) => {
+      buf += d;
+      for (const line of buf.split('\n').slice(0, -1)) {
+        try { const m = JSON.parse(line); if (m.id != null) replies.set(m.id, m); } catch { /* partial */ }
+      }
+      buf = buf.slice(buf.lastIndexOf('\n') + 1);
+    });
+    say({ jsonrpc: '2.0', id: 1, method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'parity', version: '1' } } });
+    say({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} });
+    for (let i = 0; i < 100 && !replies.has(2); i++) await new Promise((r) => setTimeout(r, 50));
+    mcp.kill('SIGKILL');
+
+    const mcpTools = replies.get(2)?.result?.tools;
+    if (!mcpTools) fail('could not read tools/list from the MCP server — parity check could not run');
+    if (mcpTools.length !== 12) fail(`MCP server advertises ${mcpTools.length} tools, expected 12`);
+
+    const drift = [];
+    const mcpByName = new Map(mcpTools.map((t) => [t.name, t]));
+    for (const [name, t] of Object.entries(tools)) {
+      const m = mcpByName.get(name);
+      if (!m) { drift.push(`only here: ${name}`); continue; }
+      if (m.description !== t.description) {
+        drift.push(`${name}: description differs from the MCP server`);
+      }
+    }
+    for (const n of mcpByName.keys()) if (!tools[n]) drift.push(`only in MCP: ${n}`);
+    if (drift.length) {
+      fail(`DRIFTED from livetennisapi-mcp — the two packages must describe the same tools ` +
+           `identically:\n    ` + drift.join('\n    '));
+    }
+    console.log('  parity: 12 tools + descriptions identical to livetennisapi-mcp');
   } else {
-    console.log('  (livetennisapi-mcp not checked out alongside — skipped the parity cross-check)');
+    console.log('  (livetennisapi-mcp not built alongside — PARITY CHECK SKIPPED)');
   }
 
   // 2. Metadata a model needs in order to choose and fill in the tool.
