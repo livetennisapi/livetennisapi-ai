@@ -1,0 +1,54 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test on node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm install
+      - run: npm run typecheck
+
+      # `npm test` builds first, then runs both suites — tools-output.mjs
+      # (every tool's execute against a local stub upstream) and
+      # generate-text.mjs (the full generateText loop against a mock model).
+      # No credentials, no network beyond localhost.
+      - run: npm test
+
+  build:
+    name: build + install from the tarball
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+      - run: npm install
+      - run: npm run build
+
+      - name: ESM entry loads and exports the tool set
+        run: |
+          node -e "import('./dist/index.js').then(m => { if (!m.livetennisTools) process.exit(1); console.log('ESM ok'); })"
+
+      - name: Pack and install from the tarball
+        run: |
+          npm pack --pack-destination /tmp
+          mkdir -p /tmp/clean && cd /tmp/clean && npm init -y >/dev/null
+          npm install /tmp/livetennisapi-ai-*.tgz ai@^7
+          node --input-type=module -e "import('livetennisapi-ai').then(m => { if (!m.livetennisTools) process.exit(1); console.log('installed ok'); })"

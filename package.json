@@ -31,7 +31,7 @@
     "url": "https://github.com/livetennisapi/livetennisapi-ai/issues"
   },
   "license": "MIT",
-  "author": "Live Tennis API",
+  "author": "Live Tennis API <hello@livetennisapi.com>",
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -62,7 +62,7 @@
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
-    "livetennisapi": "^1.0.2",
+    "livetennisapi": "^1.2.0",
     "zod": "^3.25.76"
   },
   "peerDependencies": {
