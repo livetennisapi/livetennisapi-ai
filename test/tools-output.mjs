@@ -66,6 +66,59 @@ const ANALYSIS = {
   profile: { win_probability_p1: 0.61, expected_closeness: 0.4, volatility_rating: 'medium', key_factors: ['serve'] },
   thesis: { pick_side: 1, confidence: 0.7, state: 'active', reasoning: 'Better on hard courts.' },
 };
+const TOURNAMENT = {
+  id: 'test-open', name: 'Test Open', tour: 'atp', surface: 'hard', indoor: false,
+  city: 'Testville', country: 'NL', category: 'atp_250',
+};
+const ARCHIVE_MATCH = {
+  id: 555, tour: 'atp', tournament: 'Wimbledon', event_date: '1980-06-23', round: 'F', level: 'G',
+  surface: 'grass', score: '1-6 7-5 6-3 6-7(16) 8-6', outcome: 'completed',
+  winner: { name: 'Bjorn Borg', country: 'SWE', rank: 1, seed: 1, player_id: 9001, hand: 'R', height_cm: 180, age: 24, entry: null },
+  loser: { name: 'John McEnroe', country: 'USA', rank: 2, seed: 2, player_id: 9002, hand: 'L', height_cm: 180, age: 21, entry: null },
+  stats: { winner: { aces: 10, double_faults: 2 }, loser: { aces: 12, double_faults: 4 } },
+};
+const ARCHIVE_BIO = {
+  id: 9001, tour: 'atp', name: 'Bjorn Borg', hand: 'R', dob: '1956-06-06', country: 'SWE',
+  height_cm: 180, career_high_rank: 1, career_high_date: '1977-08-23',
+};
+const ARCHIVE_CAREER = {
+  player: { name: 'Bjorn Borg' },
+  span: { first: '1971-05-03', last: '1993-07-05' },
+  record: { wins: 654, losses: 140, titles: 66, by_surface: { clay: { wins: 251, losses: 41 } }, by_level: { G: { wins: 141, losses: 16 } } },
+  by_year: [{ year: 1980, wins: 70, losses: 6 }],
+  serve: { matches_with_stats: 12, aces: 60, aces_per_match: 5, first_in_pct: 0.68, first_won_pct: 0.75, bp_saved_pct: 0.66 },
+};
+const H2H = {
+  players: { p1: { name: 'Roger Federer' }, p2: { name: 'Rafael Nadal' } },
+  totals: { p1_wins: 16, p2_wins: 24, meetings: 40, undecided: 0 },
+  by_surface: { clay: { p1: 2, p2: 14 }, hard: { p1: 11, p2: 9 } },
+  meetings: [{ era: 'archive', date: '2019-06-07', tournament: 'Roland Garros', round: 'SF', surface: 'clay', score: '6-3 6-4 6-2', outcome: 'completed', winner: 2, match_id: null }],
+};
+const RANKING_ROW = {
+  player_id: 1, player_name: 'Player One', system: 'atp', rank: 3, points: 7000,
+  previous_rank: 4, rank_movement: null, rating: null, effective_date: '2026-08-03',
+};
+const RANKINGS_META = {
+  limit: 1, offset: 0, count: 1,
+  coverage: { as_of: null, players_requested: 1, players_resolved: 1, systems_requested: ['atp'], systems_resolved: ['atp'] },
+};
+const STATISTICS = {
+  match_id: 101, coverage: 'live', as_of: '2026-08-07T10:00:00Z', games_counted: 14,
+  freshness: { derived: { coverage: 'live' }, measured: { coverage: 'live' }, measured_divergence: null },
+  players: {
+    p1: { service_games_played: 7, service_games_won: 6, hold_pct: 85.7, measured: { aces: 5, double_faults: 1 } },
+    p2: { service_games_played: 7, service_games_won: 5, hold_pct: 71.4, measured: { aces: 2, double_faults: 3 } },
+  },
+};
+const CHARTING_PLAYER = {
+  player: { name: 'Roger Federer' }, matches_charted: 500, coverage: 'curated',
+  families: { serve_influence: { pts: 100 }, shot_direction: { fh: 50 } },
+};
+const CHARTING_MATCH = {
+  charting_match_id: 77, mcp_id: '20080706-M-Wimbledon-F', gender: 'M',
+  players: { p1: { name: 'Rafael Nadal' }, p2: { name: 'Roger Federer' } },
+  families: { overview: { sets: 5 } },
+};
 
 const page = (row) => ({ data: [row], meta: { limit: 1, offset: 0, count: 1 } });
 
@@ -79,6 +132,17 @@ const upstream = createServer((req, res) => {
   };
   const path = url.split('?')[0];
   if (path.includes('/health')) return send({ status: 'ok', version: 'v1' });
+  // Most-specific paths first: several of these contain '/matches' or
+  // '/players' as a substring and would otherwise be shadowed.
+  if (path.includes('/statistics')) return send(STATISTICS);
+  if (path.includes('/charting/players')) return send(CHARTING_PLAYER);
+  if (path.includes('/charting/matches')) return send(CHARTING_MATCH);
+  if (path.includes('/history/archive/career')) return send(ARCHIVE_CAREER);
+  if (path.includes('/history/archive/players')) return send(page(ARCHIVE_BIO));
+  if (path.includes('/history/archive/matches')) return send(/\/\d+$/.test(path) ? ARCHIVE_MATCH : page(ARCHIVE_MATCH));
+  if (path.includes('/h2h')) return send(H2H);
+  if (path.includes('/rankings')) return send({ data: [RANKING_ROW], meta: RANKINGS_META });
+  if (path.includes('/tournaments')) return send(/\/[^/]+$/.test(path) && !path.endsWith('/tournaments') ? TOURNAMENT : page(TOURNAMENT));
   if (path.includes('/events')) return send(page({ timestamp: '2026-07-22T00:00:00Z', type: 'break', player: 1 }));
   if (path.includes('/analysis')) return send(ANALYSIS);
   if (path.includes('/markets') || path.includes('/prices')) return send(MARKET);
@@ -99,7 +163,7 @@ try {
 await new Promise((r) => upstream.listen(UPSTREAM_PORT, '127.0.0.1', r));
 
 /**
- * The 12 tools, and plausible arguments for each, so none is skipped for lack
+ * The 24 tools, and plausible arguments for each, so none is skipped for lack
  * of input. `payload` is the field that proves the stub's data actually made it
  * through the mapper rather than the tool merely returning `ok: true`.
  */
@@ -111,10 +175,22 @@ const EXPECTED = {
   search_players: { args: { query: 'player', limit: 2 }, payload: 'players' },
   get_player: { args: { player_id: 1 }, payload: 'player' },
   get_fixtures: { args: { limit: 2 }, payload: 'fixtures' },
+  search_tournaments: { args: { query: 'test', limit: 2 }, payload: 'tournaments' },
+  get_tournament: { args: { tournament_id: 'test-open' }, payload: 'tournament' },
   get_recent_results: { args: { limit: 2 }, payload: 'matches' },
+  search_archive_matches: { args: { player_name: 'borg', limit: 2 }, payload: 'results' },
+  get_archive_match: { args: { archive_match_id: 555 }, payload: 'result' },
+  search_archive_players: { args: { query: 'borg', limit: 2 }, payload: 'players' },
+  get_archive_career: { args: { name: 'borg' }, payload: 'record' },
+  get_h2h: { args: { player1: 'federer', player2: 'nadal' }, payload: 'totals' },
   get_match_events: { args: { match_id: 101, limit: 2 }, payload: 'events' },
   get_match_odds: { args: { match_id: 101, limit: 2 }, payload: 'market' },
+  get_rankings: { args: { system: 'atp', limit: 2 }, payload: 'rankings' },
   get_match_analysis: { args: { match_id: 101 }, payload: 'profile' },
+  get_player_rankings: { args: { player_ids: [1] }, payload: 'rankings' },
+  get_match_statistics: { args: { match_id: 101 }, payload: 'statistics' },
+  get_charting_player: { args: { name: 'federer' }, payload: 'families' },
+  get_charting_match: { args: { charting_match_id: 77 }, payload: 'families' },
   check_api_status: { args: {}, payload: 'reachable' },
 };
 
@@ -126,9 +202,9 @@ async function main() {
   const names = Object.keys(tools);
 
   // 1. Parity with the MCP server. A tool that exists on one surface and not
-  //    the other is a bug in whichever one was edited last, and 12 is the number
+  //    the other is a bug in whichever one was edited last, and 24 is the number
   //    both READMEs, both registries and the MCP test all quote.
-  if (names.length !== 12) fail(`expected 12 tools, got ${names.length}: ${names.join(', ')}`);
+  if (names.length !== 24) fail(`expected 24 tools, got ${names.length}: ${names.join(', ')}`);
   const missing = Object.keys(EXPECTED).filter((k) => !names.includes(k));
   const extra = names.filter((k) => !EXPECTED[k]);
   if (missing.length || extra.length) {
@@ -137,7 +213,7 @@ async function main() {
 
   // Parity with the MCP server — the real invariant, not just tool names.
   //
-  // These are two copies of the same 12 tools. A description improved in one and
+  // These are two copies of the same 24 tools. A description improved in one and
   // not the other is the drift that actually costs users, and it is invisible to
   // a name-only check. So compare against what the MCP server ACTUALLY
   // advertises over the protocol, rather than regexing its source: source
@@ -167,7 +243,7 @@ async function main() {
 
     const mcpTools = replies.get(2)?.result?.tools;
     if (!mcpTools) fail('could not read tools/list from the MCP server — parity check could not run');
-    if (mcpTools.length !== 12) fail(`MCP server advertises ${mcpTools.length} tools, expected 12`);
+    if (mcpTools.length !== 24) fail(`MCP server advertises ${mcpTools.length} tools, expected 24`);
 
     const drift = [];
     const mcpByName = new Map(mcpTools.map((t) => [t.name, t]));
@@ -183,7 +259,7 @@ async function main() {
       fail(`DRIFTED from livetennisapi-mcp — the two packages must describe the same tools ` +
            `identically:\n    ` + drift.join('\n    '));
     }
-    console.log('  parity: 12 tools + descriptions identical to livetennisapi-mcp');
+    console.log('  parity: 24 tools + descriptions identical to livetennisapi-mcp');
   } else {
     console.log('  (livetennisapi-mcp not built alongside — PARITY CHECK SKIPPED)');
   }
@@ -268,6 +344,31 @@ async function main() {
   const analysis = await tools.get_match_analysis.execute({ match_id: 101 }, EXEC_OPTS);
   if (analysis.thesis.pick_side !== 1) fail(`thesis not mapped: ${JSON.stringify(analysis.thesis)}`);
 
+  // The 1.1.0 surface, spot-checked the same way.
+  const h2h = await tools.get_h2h.execute({ player1: 'federer', player2: 'nadal' }, EXEC_OPTS);
+  if (h2h.totals.p2_wins !== 24) fail(`h2h totals not mapped: ${JSON.stringify(h2h.totals)}`);
+  if (h2h.players.p1 !== 'Roger Federer') fail(`h2h names not resolved: ${JSON.stringify(h2h.players)}`);
+  if (h2h.meetings[0].winner !== 2) fail(`h2h meeting winner not mapped: ${JSON.stringify(h2h.meetings[0])}`);
+
+  const rankings = await tools.get_rankings.execute({ system: 'atp', limit: 2 }, EXEC_OPTS);
+  if (rankings.rankings[0].rank !== 3 || rankings.rankings[0].points !== 7000) {
+    fail(`ranking row not mapped: ${JSON.stringify(rankings.rankings[0])}`);
+  }
+
+  const pr = await tools.get_player_rankings.execute({ player_ids: [1] }, EXEC_OPTS);
+  if (pr.coverage?.players_resolved !== 1) fail(`rankings coverage meta not surfaced: ${JSON.stringify(pr.coverage)}`);
+
+  const arch = await tools.search_archive_matches.execute({ player_name: 'borg', limit: 2 }, EXEC_OPTS);
+  if (arch.results[0].winner.name !== 'Bjorn Borg') fail(`archive winner not mapped: ${JSON.stringify(arch.results[0])}`);
+
+  const stats = await tools.get_match_statistics.execute({ match_id: 101 }, EXEC_OPTS);
+  const p1stats = stats.statistics.players.p1;
+  if (p1stats.derived.hold_pct !== 85.7) fail(`derived stats not mapped: ${JSON.stringify(p1stats.derived)}`);
+  if (p1stats.measured.aces !== 5) fail(`measured stats not mapped: ${JSON.stringify(p1stats.measured)}`);
+
+  const charted = await tools.get_charting_player.execute({ name: 'federer' }, EXEC_OPTS);
+  if (charted.matches_charted !== 500) fail(`charting sample not mapped: ${JSON.stringify(charted)}`);
+
   // 6. The individual exports must behave identically to the set — they are the
   //    documented way to ship a subset, so they cannot be a second-class path.
   const solo = getLiveMatches({ apiKey: 'twjp_test_key', baseUrl: BASE_URL });
@@ -277,7 +378,7 @@ async function main() {
   }
 
   console.log(
-    'OK - 12 tools · description + described params + outputSchema · ' +
+    'OK - 24 tools · description + described params + outputSchema · ' +
       'output parsed by its own schema on the no-key AND success paths · ' +
       'mappers spot-checked · individual exports match the set',
   );
