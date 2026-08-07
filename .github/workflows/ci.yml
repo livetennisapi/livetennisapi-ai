@@ -25,6 +25,11 @@ jobs:
       - run: npm install
       - run: npm run typecheck
 
+      # Docs drift back toward old quota numbers and stale URLs unless something
+      # mechanical objects. This pins the current product facts.
+      - name: Truth-pin (product facts current)
+        run: sh scripts/truthcheck.sh
+
       # `npm test` builds first, then runs both suites — tools-output.mjs
       # (every tool's execute against a local stub upstream) and
       # generate-text.mjs (the full generateText loop against a mock model).
