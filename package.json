@@ -1,7 +1,7 @@
 {
   "name": "livetennisapi-ai",
   "version": "1.1.0",
-  "description": "Live Tennis API as Vercel AI SDK tools — give any AI SDK model real-time tennis scores, players, fixtures, rankings, head-to-head, the 1968–2022 results archive, market prices and model win-probability. ATP, WTA, Challenger, ITF and juniors.",
+  "description": "Live Tennis API as Vercel AI SDK tools \u2014 give any AI SDK model real-time tennis scores, players, fixtures, rankings, head-to-head, the 1968\u20132022 results archive, market prices and model win-probability. ATP, WTA, Challenger, ITF and juniors.",
   "keywords": [
     "ai",
     "ai-sdk",
@@ -59,7 +59,8 @@
     "test": "npm run build && node test/tools-output.mjs && node test/generate-text.mjs",
     "test:tools": "node test/tools-output.mjs",
     "test:generate": "node test/generate-text.mjs",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "prepare": "npm run build"
   },
   "dependencies": {
     "livetennisapi": "^1.4.0",
@@ -71,6 +72,7 @@
   "devDependencies": {
     "@types/node": "^22.0.0",
     "ai": "^7.0.0",
+    "esbuild": "^0.28.2",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0"
   },
