@@ -8,14 +8,10 @@ juniors.
 [![ci](https://github.com/livetennisapi/livetennisapi-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/livetennisapi/livetennisapi-ai/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-The npm package is pending its first publication, so until it lands install
-straight from GitHub:
-
 ```bash
-npm install github:livetennisapi/livetennisapi-ai
+npm install livetennisapi-ai
 ```
 
-Once the package is on npm this becomes `npm install livetennisapi-ai`.
 `ai` v7 is a peer dependency — this package uses whichever copy your app already has.
 
 ## Usage
