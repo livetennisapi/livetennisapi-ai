@@ -47,6 +47,8 @@ const MATCH = {
   surface: 'hard',
   indoor: false,
   winner: null,
+  event_status: 'Interrupted',
+  event_status_updated_at: '2026-08-19T09:15:00Z',
   players: { p1: { id: 1, name: 'Player One' }, p2: { id: 2, name: 'Player Two' } },
   score: { sets: [1, 0], server: 1, is_tiebreak: false, win_probability_p1: 0.61, games: [[6, 4], [3, 2]] },
 };
@@ -335,6 +337,10 @@ async function main() {
   if (m.id !== 101) fail(`expected match id 101, got ${m.id}`);
   if (m.player1 !== 'Player One' || m.player2 !== 'Player Two') fail(`players not mapped: ${JSON.stringify(m)}`);
   if (m.win_probability_p1 !== 0.61) fail(`win probability not mapped: ${m.win_probability_p1}`);
+  if (m.event_status !== 'Interrupted') fail(`event_status not mapped: ${m.event_status}`);
+  if (m.event_status_updated_at !== '2026-08-19T09:15:00Z') {
+    fail(`event_status_updated_at not mapped: ${m.event_status_updated_at}`);
+  }
   if (!m.score || m.score === '') fail('score not formatted');
   if (!live.message.includes('Player One')) fail('message does not summarise the match');
 
