@@ -1,7 +1,7 @@
 {
   "name": "livetennisapi-ai",
-  "version": "1.1.0",
-  "description": "Live Tennis API as Vercel AI SDK tools \u2014 give any AI SDK model real-time tennis scores, players, fixtures, rankings, head-to-head, the 1968\u20132022 results archive, market prices and model win-probability. ATP, WTA, Challenger, ITF and juniors.",
+  "version": "1.2.0",
+  "description": "Live Tennis API as Vercel AI SDK tools — give any AI SDK model real-time tennis scores, players, fixtures, rankings, head-to-head, the 1968–2022 results archive, market prices and model win-probability. ATP, WTA, Challenger, ITF and juniors.",
   "keywords": [
     "ai",
     "ai-sdk",

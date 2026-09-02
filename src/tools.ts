@@ -43,7 +43,7 @@ import {
 } from 'livetennisapi';
 import { z } from 'zod';
 
-export const VERSION = '1.1.0';
+export const VERSION = '1.2.0';
 
 /** Options accepted by `livetennisTools()` and by every individual tool factory. */
 export interface LiveTennisToolOptions {
@@ -235,6 +235,22 @@ const MatchOut = z.object({
       'Completed matches only: which player retired or conceded the walkover, 1 or 2. ' +
         'Null means "not a withdrawal, or no evidence", never a guess.',
     ),
+  has_analysis: z
+    .boolean()
+    .nullable()
+    .describe(
+      'Whether a model thesis or profile exists for this match (added 2026-09-02, every tier). ' +
+        'Filter on this before calling get_match_analysis, which reports the same absence. ' +
+        'Null only when the server predates the field.',
+    ),
+  has_market: z
+    .boolean()
+    .nullable()
+    .describe(
+      'Whether a match-winner market is mapped to this match (added 2026-09-02, every tier). ' +
+        'Filter on this before calling get_match_odds, which reports the same absence. ' +
+        'Null only when the server predates the field.',
+    ),
   win_probability_p1: z
     .number()
     .nullable()
@@ -408,6 +424,10 @@ function matchOut(m: Match): z.infer<typeof MatchOut> {
     // reachable through the Extensible index signature, hence the cast.
     event_status_updated_at: n(m.event_status_updated_at as string | null | undefined),
     withdrew: n(m.withdrew),
+    // Typed in livetennisapi >= 1.9; until this repo's pin moves they are only
+    // reachable through the Extensible index signature, hence the casts.
+    has_analysis: n(m.has_analysis as boolean | undefined),
+    has_market: n(m.has_market as boolean | undefined),
     win_probability_p1: n(m.score?.win_probability_p1),
   };
 }
@@ -514,6 +534,12 @@ function summarise(match: Match): string {
   if (match.event_status) {
     bits.push(`  Event status: ${match.event_status}${match.withdrew ? ` (player ${match.withdrew} withdrew)` : ''}`);
   }
+  // Only when the server sent them (added 2026-09-02) — an older server omits
+  // both, and the summary must not invent a coverage claim.
+  const hasAnalysis = match.has_analysis as boolean | undefined;
+  const hasMarket = match.has_market as boolean | undefined;
+  if (hasAnalysis != null) bits.push(`  Analysis: ${hasAnalysis ? 'available' : 'none'}`);
+  if (hasMarket != null) bits.push(`  Market: ${hasMarket ? 'mapped' : 'none'}`);
   if (match.score?.win_probability_p1 != null) {
     bits.push(`  Model win probability (${p1}): ${(match.score.win_probability_p1 * 100).toFixed(1)}%`);
   }
@@ -1468,7 +1494,8 @@ export const defineGetMatchOdds = (ctx: Context) =>
   tool({
     description:
       'Match-winner market prices for a match — implied probability per player, with ' +
-      'bid, ask and mid. Requires the PRO plan.',
+      'bid, ask and mid. Requires the PRO plan. Match rows carry has_market — check it first; ' +
+      'a match with no market mapped has no prices to return.',
     inputSchema: z.object({ match_id: matchIdField, limit: limitField(200, 10, 'price points') }),
     outputSchema: MatchOddsOutput,
     execute: ({ match_id, limit }): Promise<z.infer<typeof MatchOddsOutput>> =>
@@ -1552,7 +1579,8 @@ export const defineGetMatchAnalysis = (ctx: Context) =>
   tool({
     description:
       "Model analysis for a match: predicted win probability, the model's thesis and " +
-      'the key factors behind it. Requires the ULTRA plan.',
+      'the key factors behind it. Requires the ULTRA plan. Match rows carry has_analysis — check it ' +
+      'first; a match with no thesis or profile has nothing to return.',
     inputSchema: z.object({ match_id: matchIdField }),
     outputSchema: MatchAnalysisOutput,
     execute: ({ match_id }): Promise<z.infer<typeof MatchAnalysisOutput>> =>
