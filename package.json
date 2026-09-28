@@ -31,7 +31,11 @@
     "url": "https://github.com/livetennisapi/livetennisapi-ai/issues"
   },
   "license": "MIT",
-  "author": "Live Tennis API <hello@livetennisapi.com>",
+  "author": {
+    "name": "Synapse Research Ltd",
+    "email": "hello@livetennisapi.com",
+    "url": "https://synapsereality.io"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
