@@ -38,8 +38,10 @@ Three constraints are not up for negotiation:
    needs.
 2. **Tool names and descriptions match the MCP server**,
    [livetennisapi-mcp](https://gitlab.com/livetennisapi/livetennisapi-mcp).
-   A test checks this when the server is built next to this repo. If you
-   change a name or description here, change it there too.
+   A test checks names, descriptions and parameter names when the server is
+   built next to this repo, or when `LIVETENNISAPI_MCP_ENTRY` points at a
+   build's `dist/index.js`. If you change a name or description here, change
+   it there too.
 3. **Never retry a non-429 4xx.** A bad key or an unentitled tier cannot start
    working, and retrying only burns the caller's rate limit. (Inherited from
    the underlying [`livetennisapi`](https://gitlab.com/livetennisapi/livetennisapi-js)

@@ -11,9 +11,9 @@
  * several users, each with their own tool set on their own plan.
  *
  * Individual factories exist so a caller can ship three tools instead of
- * twenty-four. That is not a micro-optimisation: every tool's schema and
+ * twenty-five. That is not a micro-optimisation: every tool's schema and
  * description is sent to the model on every single request, so an app that only
- * needs live scores pays for the other twenty-one in tokens, on every turn,
+ * needs live scores pays for the other twenty-two in tokens, on every turn,
  * forever.
  */
 
@@ -39,6 +39,7 @@ import {
   defineGetRecentResults,
   defineGetTournament,
   defineGetUpcomingMatches,
+  definePlayerStats,
   defineSearchArchiveMatches,
   defineSearchArchivePlayers,
   defineSearchPlayers,
@@ -77,6 +78,7 @@ export function livetennisTools(options: LiveTennisToolOptions = {}) {
     get_match_events: defineGetMatchEvents(ctx),
     get_match_odds: defineGetMatchOdds(ctx),
     get_rankings: defineGetRankings(ctx),
+    player_stats: definePlayerStats(ctx),
     get_match_analysis: defineGetMatchAnalysis(ctx),
     get_player_rankings: defineGetPlayerRankings(ctx),
     get_match_statistics: defineGetMatchStatistics(ctx),
@@ -143,6 +145,9 @@ export const getMatchOdds = (o: LiveTennisToolOptions = {}) => defineGetMatchOdd
 
 /** The full published ranking table for one system. Requires the PRO plan. */
 export const getRankings = (o: LiveTennisToolOptions = {}) => defineGetRankings(createContext(o));
+
+/** One player's W/L record and splits over our own matches (2023 onward). Requires the PRO plan; serve_return needs ULTRA. */
+export const playerStats = (o: LiveTennisToolOptions = {}) => definePlayerStats(createContext(o));
 
 /** Model analysis for a match. Requires the ULTRA plan. */
 export const getMatchAnalysis = (o: LiveTennisToolOptions = {}) => defineGetMatchAnalysis(createContext(o));

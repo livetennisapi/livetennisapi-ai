@@ -11,7 +11,7 @@
  * provider rejects — fails only at that boundary. Calling `execute` by hand
  * would never notice.
  *
- * So this drives the whole loop against a MOCK model: assert all 24 tools reach
+ * So this drives the whole loop against a MOCK model: assert all 25 tools reach
  * the provider as well-formed JSON Schema, then have the mock call one and
  * confirm the result comes back through the SDK rather than through us.
  *
@@ -90,7 +90,7 @@ async function main() {
 
   // 1. Every tool reached the provider, converted to JSON Schema.
   if (!sentTools) fail('the model received no tools at all');
-  if (sentTools.length !== 24) fail(`the model received ${sentTools.length} tools, expected 24`);
+  if (sentTools.length !== 25) fail(`the model received ${sentTools.length} tools, expected 25`);
   for (const t of sentTools) {
     if (!t.name) fail(`a tool reached the provider with no name: ${JSON.stringify(t).slice(0, 120)}`);
     if (!t.description) fail(`${t.name} reached the provider with no description`);
@@ -122,7 +122,7 @@ async function main() {
   if (!result.text.includes('Player One')) fail(`unexpected final text: ${result.text}`);
 
   console.log(
-    'OK - generateText round trip · 24 tools converted to JSON Schema with descriptions intact · ' +
+    'OK - generateText round trip · 25 tools converted to JSON Schema with descriptions intact · ' +
       'tool executed by the SDK · structured result returned to the model',
   );
 }

@@ -3,6 +3,29 @@
 All notable changes are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] (2026-10-22)
+
+### Added
+- `player_stats`, the 25th tool, with `playerStats` as its own export. It reads
+  `GET /players/{playerId}/stats` through `getPlayerStats()` in livetennisapi 1.10.0. It covers
+  one player's completed singles matches in our own data from 2023 on, by default the last 365
+  days. You get the W-L record in total, over the last 12 months and by surface, venue, level
+  and season. It also returns the set record, withdrawals and the last N matches, each score
+  from the player's side. On ULTRA it passes `serve_return` through, the summed serve and return statistics.
+  Below ULTRA that field is `null`. The tool takes `player_id`, `from`, `to`, `surface`, `level`
+  and `last`, and needs the PRO plan. Its name, description and parameters are the same as
+  `player_stats` in livetennisapi-mcp 1.6.1.
+- A doubles-team id gets `ok: false` and a message that stats cover singles only, so the model
+  asks for each player's own id. The API refuses such an id with 400 `doubles_not_supported`.
+- An empty sample keeps its nulls. The W-L and set counts are 0. Each percentage is `null` and
+  not 0, and so are the `serve_return` sums. The message says "no matches".
+- The parity test also compares parameter names and required parameters with the MCP server.
+  `LIVETENNISAPI_MCP_ENTRY` points it at any build, such as a published one in a scratch folder.
+
+### Changed
+- The livetennisapi dependency is now `^1.10.0`.
+- The plan list in the upgrade message and in `check_api_status` names player records under PRO.
+
 ## [1.2.1] (2026-10-22)
 
 1.2.0 was never published to npm. This release ships everything listed under 1.2.0, plus the

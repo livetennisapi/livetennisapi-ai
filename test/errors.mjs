@@ -487,6 +487,131 @@ await check('blank resets_at stays a per-minute 429 and is retried', live, {}, (
   ...(asked.length === 2 ? [] : [`expected a retry (2 requests), got ${asked.length}`]),
 ]);
 
+// -- player_stats (1.3.0) ---------------------------------------------------------
+
+const stats = tools.player_stats;
+
+reply = () => ({ status: 403, body: { error: 'upgrade_required' } });
+await check('player_stats plan gate (403)', stats, { player_id: 34 }, (r) => [
+  ...isOk(r, false),
+  ...has(r, /requires the PRO plan/, 'the PRO plan'),
+  ...has(r, /player records/, 'player records under PRO in the plan list'),
+]);
+
+reply = () => ({ status: 404, body: { error: 'not_found' } });
+await check('player_stats unknown player (404)', stats, { player_id: 999999999 }, (r) => [
+  ...isOk(r, false),
+  ...has(r, /No data found/, 'not found'),
+]);
+
+// The real API refuses a doubles-team id with this body (checked 2026-10-22).
+asked = [];
+reply = () => ({
+  status: 400,
+  body: {
+    error: 'doubles_not_supported',
+    detail: 'this id is a doubles team; player statistics are computed over singles matches only',
+  },
+});
+await check('player_stats doubles-team id (400 doubles_not_supported)', stats, { player_id: 18019 }, (r) => [
+  ...isOk(r, false),
+  ...has(r, /doubles team/, 'the doubles refusal'),
+  ...has(r, /member player id/, 'the remedy'),
+  ...lacks(r, /^Request failed/, 'a generic failure'),
+  ...(asked.length === 1 ? [] : [`expected one request, got ${asked.length}`]),
+]);
+
+// An empty sample, as the real API answers a window with no matches: every
+// percentage null, every table empty, serve_return counts null.
+const zero = { matches: 0, wins: 0, losses: 0, win_pct: null };
+reply = () => ({
+  status: 200,
+  body: {
+    player: { id: 34, name: 'Player One' },
+    window: { from: '2023-01-01T00:00:00Z', to: '2023-01-02T23:59:59.999999Z' },
+    records: {
+      overall: zero, last_12_months: zero, by_surface: {}, by_venue: {}, by_level: {}, by_season: {},
+      sets: { sample: { matches: 0 }, tiebreaks: { played: 0, won: 0, lost: 0, win_pct: null } },
+      withdrawals: { retired: { given: 0, received: 0 } },
+      recent: [],
+    },
+    serve_return: {
+      matches: 0, matches_with_stats: 0,
+      serve: { aces: { total: null, matches: 0, per_match: null } },
+      return: { return_games_won: { numerator: null, denominator: null, pct: null, matches: 0 } },
+    },
+  },
+});
+await check('player_stats empty sample keeps nulls', stats, { player_id: 34, from: '2023-01-01', to: '2023-01-02' }, (r) => [
+  ...isOk(r, true),
+  ...(r.overall?.win_pct === null && r.overall?.matches === 0 ? [] : [`overall.win_pct should stay null: ${JSON.stringify(r.overall)}`]),
+  ...(r.last_12_months?.win_pct === null ? [] : ['last_12_months.win_pct should stay null']),
+  ...(r.sets?.tiebreaks?.win_pct === null ? [] : ['sets.tiebreaks.win_pct should stay null']),
+  ...(r.serve_return?.serve?.aces?.total === null ? [] : ['serve_return aces total should stay null']),
+  ...(Array.isArray(r.recent) && r.recent.length === 0 ? [] : ['recent should be an empty array']),
+  ...(r.by_surface && Object.keys(r.by_surface).length === 0 ? [] : ['by_surface should be an empty object']),
+  ...has(r, /Overall: no matches/, 'no matches'),
+  ...lacks(r, /0%|NaN|null/, 'an invented percentage'),
+]);
+
+// Below ULTRA the server leaves serve_return out; the field is null.
+reply = () => ({ status: 200, body: { player: { id: 34, name: 'P' }, records: { overall: zero, recent: [] } } });
+await check('player_stats below ULTRA has serve_return null', stats, { player_id: 34 }, (r) => [
+  ...isOk(r, true),
+  ...(r.serve_return === null ? [] : [`serve_return should be null: ${JSON.stringify(r.serve_return)}`]),
+  ...lacks(r, /Serve\/return/, 'a serve/return line'),
+]);
+
+// Ragged server objects: a string count, a row that is not an object, a
+// recent entry that is not an object, a games array of the wrong shape.
+reply = () => ({
+  status: 200,
+  body: {
+    player: { id: '34', name: 7 },
+    records: {
+      overall: { matches: '3', wins: 2, losses: 1, win_pct: 66.7 },
+      by_surface: { clay: 'n/a', hard: { matches: 2, wins: 2 } },
+      sets: ['not', 'an', 'object'],
+      recent: ['x', { match_id: 1, won: 'yes', score: { games: [[6, 'x'], [4]] }, opponent: 'Nobody' }],
+    },
+    serve_return: 'withheld',
+  },
+});
+await check('player_stats with ragged server objects', stats, { player_id: 34 }, (r) => [
+  ...isOk(r, true),
+  ...(r.player?.id === null && r.player?.name === null ? [] : [`mistyped player fields should map to null: ${JSON.stringify(r.player)}`]),
+  ...(r.overall?.matches === null ? [] : ['a string count should map to null']),
+  ...(r.by_surface && !('clay' in r.by_surface) && r.by_surface.hard?.losses === null ? [] : [`by_surface not cleaned: ${JSON.stringify(r.by_surface)}`]),
+  ...(r.sets === null ? [] : ['an array sets block should map to null']),
+  ...(r.serve_return === null ? [] : ['a string serve_return should map to null']),
+  ...(r.recent?.length === 2 && r.recent[0].match_id === null ? [] : [`recent not cleaned: ${JSON.stringify(r.recent)}`]),
+  ...(r.recent?.[1]?.won === null && r.recent?.[1]?.opponent === null ? [] : [`recent[1] not cleaned: ${JSON.stringify(r.recent?.[1])}`]),
+  ...(r.recent?.[1]?.score === '6-4 ?-?' ? [] : [`recent[1] score: ${JSON.stringify(r.recent?.[1]?.score)}`]),
+]);
+
+// A "__proto__" key survives JSON.parse as an ordinary key and must stay a row.
+reply = () => ({
+  status: 200,
+  json: true,
+  raw: '{"player":{"id":34},"records":{"by_surface":{"__proto__":{"matches":1,"wins":1,"losses":0,"win_pct":100},"hard":{"matches":2,"wins":1,"losses":1,"win_pct":50}}}}',
+});
+await check('player_stats table with a __proto__ key', stats, { player_id: 34 }, (r) => [
+  ...isOk(r, true),
+  ...(r.by_surface?.hard?.wins === 1 ? [] : [`by_surface lost its rows: ${JSON.stringify(r.by_surface)}`]),
+]);
+
+reply = () => ({ status: 200, body: { player: { id: 34 } } });
+await check('player_stats with no records block', stats, { player_id: 34 }, (r) => [
+  ...isOk(r, true),
+  ...has(r, /No record returned/, 'that no record came back'),
+]);
+
+reply = () => ({ status: 429, body: { error: 'rate_limited', scope: 'day', limit_per_day: 10000, resets_at: '2026-10-23T21:00:00Z' } });
+await check('player_stats daily quota', stats, { player_id: 34 }, (r) => [
+  ...isOk(r, false),
+  ...has(r, /Daily request quota/, 'the daily quota'),
+]);
+
 upstream.closeAllConnections?.();
 upstream.close();
 if (failures) {

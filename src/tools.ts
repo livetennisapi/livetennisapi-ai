@@ -1,5 +1,5 @@
 /**
- * The 24 Live Tennis API tools, as Vercel AI SDK tools.
+ * The 25 Live Tennis API tools, as Vercel AI SDK tools.
  *
  * These are a deliberate port of the MCP server's tools
  * (`livetennisapi-mcp/src/server.ts`) — same names, same descriptions, same
@@ -45,7 +45,7 @@ import {
 } from 'livetennisapi';
 import { z } from 'zod';
 
-export const VERSION = '1.2.1';
+export const VERSION = '1.3.0';
 
 /** Options accepted by `livetennisTools()` and by every individual tool factory. */
 export interface LiveTennisToolOptions {
@@ -264,7 +264,7 @@ function describeFailure(err: unknown, apiKey: string): string {
       `include this endpoint. Upgrade at https://livetennisapi.com/#pricing\n\n` +
       `Plans: FREE has live and upcoming matches, scores, players, fixtures and tournaments. ` +
       `BASIC adds historical results, the results archive (1968 to 2022) and head-to-head. ` +
-      `PRO adds match events, market prices and the rankings listing. ` +
+      `PRO adds match events, market prices, the rankings listing and player records. ` +
       `ULTRA adds model analysis, win probability, per-player as-of rankings, in-play statistics, ` +
       `shot-level charting and the live WebSocket feed.`
     );
@@ -327,6 +327,11 @@ function describeFailure(err: unknown, apiKey: string): string {
       'The API refuses to sum two people into one record, so nothing was guessed. ' +
       'Retry with a more specific name (one of the candidates above).'
     );
+  }
+  if (err instanceof BadRequest && err.errorCode === 'doubles_not_supported') {
+    // player_stats covers singles only. The remedy is a different id, not a
+    // retry, so it is a value with that remedy, as an ambiguous name is.
+    return 'That id is a doubles team. Player stats cover singles only, so query each member player id instead.';
   }
   // A genuine fault. The MCP server flags these with `isError: true`, which
   // has no AI SDK equivalent other than throwing — and a throw out of
@@ -398,7 +403,7 @@ export function createContext(options: LiveTennisToolOptions = {}): Context {
 }
 
 // -- shared field definitions --------------------------------------------------
-// Declared once so all 24 tools describe the same concept the same way.
+// Declared once so all 25 tools describe the same concept the same way.
 
 const okField = z
   .boolean()
@@ -655,6 +660,51 @@ function numRecord(v: unknown): Record<string, number | null> | null {
   const out: Record<string, number | null> = {};
   for (const [k, x] of Object.entries(v)) if (x === null || num(x) !== null) out[k] = x === null ? null : (x as number);
   return out;
+}
+
+/** A plain server object, or null for anything else (an array, a string, null). */
+const plainObject = (v: unknown): Record<string, unknown> | null =>
+  v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+
+/** One W/L row of player_stats, each field read by type, or null when the row is not an object. */
+function winLossOut(v: unknown): z.infer<typeof WinLossOut> | null {
+  const row = plainObject(v);
+  if (!row) return null;
+  return { matches: num(row.matches), wins: num(row.wins), losses: num(row.losses), win_pct: num(row.win_pct) };
+}
+
+/** A player_stats W/L table by key (surface, venue, level, season). Rows that are not objects are dropped. */
+function winLossRecord(v: unknown): Record<string, z.infer<typeof WinLossOut>> | null {
+  const table = plainObject(v);
+  if (!table) return null;
+  // fromEntries, not assignment: a "__proto__" key from JSON.parse would set
+  // the prototype of a plain object instead of adding a row.
+  return Object.fromEntries(
+    Object.entries(table).flatMap(([k, row]) => {
+      const wl = winLossOut(row);
+      return wl ? [[k, wl] as const] : [];
+    }),
+  );
+}
+
+/** "56-2 (96.6%)", or "no matches" on an empty sample. */
+function winLossLine(wl: z.infer<typeof WinLossOut> | null): string {
+  if (!wl || !wl.matches) return 'no matches';
+  return `${wl.wins ?? 0}-${wl.losses ?? 0}${wl.win_pct != null ? ` (${wl.win_pct}%)` : ''}`;
+}
+
+/**
+ * A player_stats recent-match score from the player's side, "6-4 3-6 6-2", or
+ * null when the server held no score row. Games come as [[player], [opponent]],
+ * and each value may be null, which reads as "?".
+ */
+function sideScore(score: unknown): string | null {
+  const games = plainObject(score)?.games;
+  if (!Array.isArray(games) || games.length !== 2 || !Array.isArray(games[0])) return null;
+  const mine = games[0] as unknown[];
+  const theirs = Array.isArray(games[1]) ? (games[1] as unknown[]) : [];
+  if (!mine.length) return null;
+  return mine.map((v, i) => `${num(v) ?? '?'}-${num(theirs[i]) ?? '?'}`).join(' ');
 }
 
 /** A W-L table by key (surface, level), each row reduced to two numbers. */
@@ -1068,6 +1118,68 @@ const H2HOutput = outputOf({
 
 const RankingsOutput = outputOf({
   rankings: z.array(RankingRowOut).optional().describe('The table in rank order.'),
+});
+
+const WinLossOut = z.object({
+  matches: z.number().nullable().describe('Matches in the sample.'),
+  wins: z.number().nullable().describe('Wins.'),
+  losses: z.number().nullable().describe('Losses.'),
+  win_pct: z.number().nullable().describe('Win percentage, one decimal; null (never 0) on an empty sample.'),
+});
+
+const PlayerStatsOutput = outputOf({
+  player: z
+    .object({ id: z.number().nullable(), name: z.string().nullable() })
+    .optional()
+    .describe('The player.'),
+  window: z
+    .object({ from: z.string().nullable(), to: z.string().nullable() })
+    .optional()
+    .describe('The window applied, UTC.'),
+  overall: WinLossOut.nullable().optional().describe('W/L over the window.'),
+  last_12_months: WinLossOut.nullable().optional().describe('W/L over the 12 months ending at the window end.'),
+  by_surface: z.record(WinLossOut).nullable().optional().describe('W/L keyed hard, clay, grass, unknown.'),
+  by_venue: z.record(WinLossOut).nullable().optional().describe('W/L keyed indoor, outdoor, unknown.'),
+  by_level: z.record(WinLossOut).nullable().optional().describe('W/L keyed by match tour, or unknown.'),
+  by_season: z.record(WinLossOut).nullable().optional().describe('W/L keyed by UTC calendar year.'),
+  sets: z
+    .record(z.unknown())
+    .nullable()
+    .optional()
+    .describe(
+      'Set-based record: sample, tiebreaks, deciding_sets, after_winning_first_set, ' +
+        'after_losing_first_set, comebacks, sets.',
+    ),
+  withdrawals: z
+    .record(z.unknown())
+    .nullable()
+    .optional()
+    .describe('Retired / walkover / default, each as given (this player) and received (the opponent).'),
+  recent: z
+    .array(
+      z.object({
+        match_id: z.number().nullable().describe('Match id. Pass to get_match.'),
+        date: z.string().nullable().describe('Match date.'),
+        tournament: z.string().nullable().describe('Event name.'),
+        round: z.string().nullable().describe('Round.'),
+        surface: z.string().nullable().describe('Court surface.'),
+        opponent: z.string().nullable().describe('Opponent name.'),
+        opponent_id: z.number().nullable().describe('Opponent player id.'),
+        won: z.boolean().nullable().describe('True when this player won.'),
+        outcome: z.string().nullable().describe('completed, retired, walkover or default.'),
+        score: z.string().nullable().describe('Final score from this player\'s side, e.g. "6-4 3-6 6-2".'),
+      }),
+    )
+    .optional()
+    .describe('The last N matches, newest first.'),
+  serve_return: z
+    .record(z.unknown())
+    .nullable()
+    .optional()
+    .describe(
+      'ULTRA only, null below: summed serve and return statistics, each ratio as ' +
+        'numerator/denominator/pct with its match count.',
+    ),
 });
 
 const PlayerRankingsOutput = outputOf({
@@ -1872,6 +1984,122 @@ export const defineGetRankings = (ctx: Context) =>
       }),
   });
 
+export const definePlayerStats = (ctx: Context) =>
+  tool({
+    // Word for word the description of livetennisapi-mcp's player_stats.
+    description:
+      "One player's record over our own completed singles matches (2023 onward), by default the last " +
+      '365 days. It gives W/L overall, over the last 12 months and by surface, venue, level and season. ' +
+      'It also gives tiebreaks, deciding sets, the record after winning or losing the first set, ' +
+      'comebacks, withdrawals and the last N matches. Every count carries its sample size, and a ' +
+      'percentage on an empty sample is null, never 0. On ULTRA it adds serve_return: measured serve ' +
+      'and return statistics summed over the window. Singles only, so a doubles-team id is refused. ' +
+      'For 1968 to 2022 use get_archive_career. Requires the PRO plan (serve_return requires ULTRA).',
+    inputSchema: z.object({
+      player_id: z.number().int().describe('Player id, as returned by search_players.'),
+      from: z
+        .string()
+        .optional()
+        .describe('Window start: YYYY-MM-DD (start of that day) or a UTC ISO-8601 instant. Default to minus 365 days.'),
+      to: z
+        .string()
+        .optional()
+        .describe('Window end: YYYY-MM-DD (the whole of that day) or a UTC ISO-8601 instant. Default now.'),
+      surface: z
+        .enum(['hard', 'clay', 'grass', 'indoor'])
+        .optional()
+        .describe('hard, clay or grass read the match surface; indoor keeps matches stated indoor, on any surface.'),
+      level: z
+        .enum(['atp', 'wta', 'challenger', 'itf', 'juniors'])
+        .optional()
+        .describe('The match tour. A match with no stated tour matches no level.'),
+      last: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe('How many recent matches to list, newest first (1-50, default 20).'),
+    }),
+    outputSchema: PlayerStatsOutput,
+    execute: ({ player_id, from, to, surface, level, last }): Promise<z.infer<typeof PlayerStatsOutput>> =>
+      ctx.guard(PlayerStatsOutput, async () => {
+        const body = await ctx.client.getPlayerStats(player_id, { from, to, surface, level, last });
+        // Every block is read by type: the server shapes these objects freely,
+        // and one stray value would fail the schema the result is parsed against.
+        const r = plainObject(body?.records);
+        if (!r) return { ok: true as const, message: 'No record returned for that player id.' };
+        const player = { id: num(body.player?.id), name: str(body.player?.name) };
+        const window = { from: str(body.window?.from), to: str(body.window?.to) };
+        const overall = winLossOut(r.overall);
+        const last12 = winLossOut(r.last_12_months);
+        const bySurface = winLossRecord(r.by_surface);
+        const recent = (Array.isArray(r.recent) ? r.recent : []).map((item: unknown) => {
+          const m = plainObject(item) ?? {};
+          const opponent = plainObject(m.opponent);
+          return {
+            match_id: num(m.match_id),
+            date: str(m.date),
+            tournament: str(m.tournament),
+            round: str(m.round),
+            surface: str(m.surface),
+            opponent: str(opponent?.name),
+            opponent_id: num(opponent?.id),
+            won: bool(m.won),
+            outcome: str(m.outcome),
+            score: sideScore(m.score),
+          };
+        });
+        const lines = [
+          `${player.name ?? 'Player'} [${player.id ?? player_id}], ${window.from ?? '?'} → ${window.to ?? '?'}`,
+          `Overall: ${winLossLine(overall)} · last 12 months: ${winLossLine(last12)}`,
+        ];
+        if (bySurface && Object.keys(bySurface).length) {
+          lines.push(
+            `By surface: ${Object.entries(bySurface)
+              .map(([s, wl]) => `${s} ${winLossLine(wl)}`)
+              .join(' · ')}`,
+          );
+        }
+        if (recent.length) {
+          lines.push(
+            `Recent (${recent.length}):`,
+            ...recent.map(
+              (m) =>
+                `  ${m.date ?? '?'} ${m.won === true ? 'W' : m.won === false ? 'L' : '?'} vs ${m.opponent ?? '?'}` +
+                `${m.score ? ` ${m.score}` : ''}${m.outcome && m.outcome !== 'completed' ? ` (${m.outcome})` : ''}` +
+                `${m.tournament ? `, ${m.tournament}` : ''}`,
+            ),
+          );
+        }
+        // serve_return is absent below ULTRA. It is passed through as the
+        // server sent it, like the MCP server does.
+        const serveReturn = plainObject(body.serve_return);
+        if (serveReturn) {
+          lines.push(
+            `Serve/return: summed over ${num(serveReturn.matches_with_stats) ?? 0} of ` +
+              `${num(serveReturn.matches) ?? 0} matches with statistics.`,
+          );
+        }
+        return {
+          ok: true as const,
+          message: lines.join('\n'),
+          player,
+          window,
+          overall,
+          last_12_months: last12,
+          by_surface: bySurface,
+          by_venue: winLossRecord(r.by_venue),
+          by_level: winLossRecord(r.by_level),
+          by_season: winLossRecord(r.by_season),
+          sets: plainObject(r.sets),
+          withdrawals: plainObject(r.withdrawals),
+          recent,
+          serve_return: serveReturn,
+        };
+      }),
+  });
+
 // -- ULTRA --
 
 export const defineGetMatchAnalysis = (ctx: Context) =>
@@ -2264,7 +2492,7 @@ async function checkStatus(ctx: Context): Promise<z.infer<typeof ApiStatusOutput
   const plans =
     '\n\nFREE  = live & upcoming matches, scores, players, fixtures, tournaments\n' +
     'BASIC = + historical results, the results archive (1968 to 2022), head-to-head\n' +
-    'PRO   = + match events, market prices, rankings listing\n' +
+    'PRO   = + match events, market prices, rankings listing, player records\n' +
     'ULTRA = + model analysis, win probability, as-of rankings, match statistics, charting, live feed';
 
   // GET /usage names the plan outright and does not count against the quota.

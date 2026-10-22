@@ -2,11 +2,11 @@
 
 To give a [Vercel AI SDK](https://ai-sdk.dev) agent live tennis data, install `livetennisapi-ai`
 and pass `livetennisTools()` as the `tools` of `generateText` or `streamText`. The model then gets
-24 tools backed by [Live Tennis API](https://livetennisapi.com). They cover live scores, upcoming
-matches, players, fixtures, tournaments, rankings and head-to-head. They also reach the 1968 to
-2022 results archive, market prices and model win probability. Tours: ATP, WTA, Challenger, ITF
-and juniors. A free key
-(100 requests a day, no card) runs the live tools.
+25 tools backed by [Live Tennis API](https://livetennisapi.com). They cover live scores, upcoming
+matches, players, fixtures, tournaments, rankings and head-to-head. They also reach player stats
+(win-loss splits by surface, venue, level and season), the 1968 to 2022 results archive, market
+prices and model win probability. Tours: ATP, WTA, Challenger, ITF and juniors. A free key (100
+requests a day, no card) runs the live tools.
 
 [![npm](https://img.shields.io/npm/v/livetennisapi-ai.svg)](https://www.npmjs.com/package/livetennisapi-ai)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -57,7 +57,7 @@ See [Errors are values](#errors-are-values).
 ### Picking a subset
 
 Every tool is also exported on its own. Each tool's schema and description goes to the model on
-**every** request. An app that only needs live scores pays tokens for the other 22 on every turn.
+**every** request. An app that only needs live scores pays tokens for the other 23 on every turn.
 
 ```ts
 import { getLiveMatches, getMatchScore } from 'livetennisapi-ai';
@@ -68,7 +68,7 @@ const tools = {
 };
 ```
 
-## The 24 tools
+## The 25 tools
 
 | Tool | Individual export | Does | Plan |
 |---|---|---|---|
@@ -91,6 +91,7 @@ const tools = {
 | `get_match_events` | `getMatchEvents` | Match timeline: breaks, games, momentum | PRO |
 | `get_match_odds` | `getMatchOdds` | Match-winner market: bid, ask, mid | PRO |
 | `get_rankings` | `getRankings` | The full published ranking table per system | PRO |
+| `player_stats` | `playerStats` | One player's W-L by surface, venue, level and season, set record, recent matches. Serve and return sums on ULTRA | PRO |
 | `get_match_analysis` | `getMatchAnalysis` | Model win probability and thesis | ULTRA |
 | `get_player_rankings` | `getPlayerRankings` | Point-in-time rankings for specific players | ULTRA |
 | `get_match_statistics` | `getMatchStatistics` | In-play stats, derived and measured | ULTRA |
@@ -101,7 +102,7 @@ const tools = {
 
 FREE has live and upcoming matches, scores, players, fixtures and tournaments. BASIC adds
 historical results, the results archive (1968 to 2022) and head-to-head. PRO adds match events,
-market prices and the rankings listing. ULTRA adds model analysis, win probability, per-player
+market prices, the rankings listing and player records. ULTRA adds model analysis, win probability, per-player
 as-of rankings, in-play statistics, shot-level charting and the live WebSocket feed.
 
 Prices are at https://livetennisapi.com/#pricing. `check_api_status` tells you which plan your
@@ -130,6 +131,8 @@ now." These answers are also `ok: true`:
 
 - `get_h2h` with `players: null` when no player matches the names.
 - `get_match_statistics` with `players: null` when the match has no statistics yet.
+- `player_stats` over a window with no matches. The W-L and set counts are 0. Every percentage
+  is `null`, never 0, and so are the `serve_return` sums.
 - A single-item tool with no data field, when the API answered with nothing.
 
 `ok: false` comes with a message that says what to do. It covers these cases:
@@ -143,6 +146,7 @@ now." These answers are also `ok: true`:
 | Any other 403, such as a firewall page | That the request was refused and it is not a plan limit |
 | Unknown id, or no data for it (404) | No data found for that request |
 | Ambiguous name (400) | The candidate names, so the model can retry with one |
+| Doubles-team id to `player_stats` (400) | That stats cover singles only, so query each player's own id |
 | Rate limit (429) | One of the three shapes below |
 | Network error, timeout, 5xx, or anything else | `Request failed:` and the reason, with the API key cut out |
 | An answer the tool's `outputSchema` cannot hold | `Request failed:` and the field that was wrong |
@@ -197,7 +201,7 @@ against it when the tool runs, only when an app reloads a saved chat with
 
 ## Also available
 
-The same 24 tools run as an MCP server for Claude, Cursor and other MCP clients:
+The same 25 tools run as an MCP server for Claude, Cursor and other MCP clients:
 [`livetennisapi-mcp`](https://www.npmjs.com/package/livetennisapi-mcp). The REST and WebSocket
 client underneath is [`livetennisapi`](https://www.npmjs.com/package/livetennisapi).
 
@@ -209,11 +213,10 @@ npm run typecheck
 npm test          # builds, then runs three suites against a local stub. No network, no key.
 ```
 
-`test/tools-output.mjs` runs all 24 tools twice, once with no key and once against a stub
+`test/tools-output.mjs` runs all 25 tools twice, once with no key and once against a stub
 upstream. It parses every result with the tool's own `outputSchema`. `test/errors.mjs` sends
-the failure responses: each 429 shape (malformed bodies included), 401, 403, 404, an ambiguous
-name, empty lists, a network error and a malformed key. `test/generate-text.mjs` runs a full
-`generateText` loop against a mock model. That proves the zod schemas survive conversion to
+each 429 shape (malformed bodies included), 401, 403, 404 and an ambiguous name. It also sends a
+doubles-team id, empty lists, an empty `player_stats` sample, a network error and a malformed key. `test/generate-text.mjs` runs a full `generateText` loop against a mock model. That proves the zod schemas survive conversion to
 JSON Schema on the way to a provider.
 
 ## Links
