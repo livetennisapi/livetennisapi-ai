@@ -44,6 +44,7 @@ const MATCH = {
   tournament: 'Test Open',
   round: 'QF',
   status: 'live',
+  scheduled_time: '2026-08-19T08:00:00Z',
   surface: 'hard',
   indoor: false,
   winner: null,
@@ -148,6 +149,7 @@ const upstream = createServer((req, res) => {
   };
   const path = url.split('?')[0];
   if (path.includes('/health')) return send({ status: 'ok', version: 'v1' });
+  if (path.endsWith('/usage')) return send({ tier: 'ultra', base_tier: 'ultra', tier_expires_at: null });
   // Most-specific paths first: several of these contain '/matches' or
   // '/players' as a substring and would otherwise be shadowed.
   if (path.includes('/statistics')) return send(STATISTICS);
@@ -357,6 +359,8 @@ async function main() {
   if (m.event_status_updated_at !== '2026-08-19T09:15:00Z') {
     fail(`event_status_updated_at not mapped: ${m.event_status_updated_at}`);
   }
+  if (m.scheduled_time !== '2026-08-19T08:00:00Z') fail(`scheduled_time not mapped: ${m.scheduled_time}`);
+  if (live.matches[1].scheduled_time !== null) fail('absent scheduled_time should map to null');
   if (!m.score || m.score === '') fail('score not formatted');
   if (!live.message.includes('Player One')) fail('message does not summarise the match');
   // has_analysis / has_market (added 2026-09-02): present-true and present-false
@@ -401,6 +405,9 @@ async function main() {
   const p1stats = stats.statistics.players.p1;
   if (p1stats.derived.hold_pct !== 85.7) fail(`derived stats not mapped: ${JSON.stringify(p1stats.derived)}`);
   if (p1stats.measured.aces !== 5) fail(`measured stats not mapped: ${JSON.stringify(p1stats.measured)}`);
+
+  const status = await tools.check_api_status.execute({}, EXEC_OPTS);
+  if (status.tier !== 'ULTRA') fail(`check_api_status did not read the plan from /usage: ${status.tier}`);
 
   const charted = await tools.get_charting_player.execute({ name: 'federer' }, EXEC_OPTS);
   if (charted.matches_charted !== 500) fail(`charting sample not mapped: ${JSON.stringify(charted)}`);

@@ -44,7 +44,13 @@ const upstream = createServer((req, res) => {
 });
 await new Promise((r) => upstream.listen(UPSTREAM_PORT, '127.0.0.1', r));
 
-const usage = { inputTokens: 10, outputTokens: 10, totalTokens: 20 };
+// The usage and finishReason shapes of the current LanguageModelV4 spec. The
+// older flat shapes (numbers, a bare string) stopped working in later ai@7
+// releases: the tool call was made but no tool result came back.
+const usage = {
+  inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+  outputTokens: { total: 10, text: 10, reasoning: 0 },
+};
 
 /** Step 1 calls the tool; step 2 answers using whatever came back. */
 let sentTools = null;
@@ -60,14 +66,14 @@ const model = new MockLanguageModelV4({
           toolName: 'get_live_matches',
           input: JSON.stringify({ limit: 2 }),
         }],
-        finishReason: 'tool-calls',
+        finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
         usage,
         warnings: [],
       };
     }
     return {
       content: [{ type: 'text', text: 'Player One leads Player Two at the Test Open.' }],
-      finishReason: 'stop',
+      finishReason: { unified: 'stop', raw: 'stop' },
       usage,
       warnings: [],
     };

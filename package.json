@@ -1,7 +1,7 @@
 {
   "name": "livetennisapi-ai",
-  "version": "1.2.0",
-  "description": "Live Tennis API as Vercel AI SDK tools — give any AI SDK model real-time tennis scores, players, fixtures, rankings, head-to-head, the 1968–2022 results archive, market prices and model win-probability. ATP, WTA, Challenger, ITF and juniors.",
+  "version": "1.2.1",
+  "description": "Vercel AI SDK tools for live tennis data. Give an AI SDK agent real-time scores, players, fixtures, rankings, head-to-head, the 1968-2022 results archive, market prices and win probability from Live Tennis API. ATP, WTA, Challenger, ITF and juniors.",
   "keywords": [
     "ai",
     "ai-sdk",
@@ -20,15 +20,22 @@
     "sports-api",
     "sports-data",
     "atp",
-    "wta"
+    "wta",
+    "agents",
+    "ai-agents",
+    "agent-tools",
+    "tennis-data",
+    "tennis-scores",
+    "livetennisapi",
+    "stream-text"
   ],
-  "homepage": "https://livetennisapi.com",
+  "homepage": "https://docs.livetennisapi.com/ai-sdk.html",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/livetennisapi/livetennisapi-ai.git"
+    "url": "git+https://gitlab.com/livetennisapi/livetennisapi-ai.git"
   },
   "bugs": {
-    "url": "https://github.com/livetennisapi/livetennisapi-ai/issues"
+    "url": "https://gitlab.com/livetennisapi/livetennisapi-ai/-/issues"
   },
   "license": "MIT",
   "author": {
@@ -54,14 +61,15 @@
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "sideEffects": false,
   "scripts": {
     "build": "tsup",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node test/tools-output.mjs && node test/generate-text.mjs",
+    "test": "npm run build && node test/tools-output.mjs && node test/errors.mjs && node test/generate-text.mjs",
     "test:tools": "node test/tools-output.mjs",
+    "test:errors": "node test/errors.mjs",
     "test:generate": "node test/generate-text.mjs",
     "prepublishOnly": "npm run build",
     "prepare": "npm run build"
@@ -81,8 +89,7 @@
     "typescript": "^5.5.0"
   },
   "publishConfig": {
-    "access": "public",
-    "provenance": true
+    "access": "public"
   },
   "overrides": {
     "tsup": {
