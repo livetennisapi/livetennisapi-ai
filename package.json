@@ -78,7 +78,7 @@
   },
   "dependencies": {
     "livetennisapi": "^1.10.0",
-    "zod": "^3.25.76"
+    "zod": "^4.6.7"
   },
   "peerDependencies": {
     "ai": "^7.0.0"
