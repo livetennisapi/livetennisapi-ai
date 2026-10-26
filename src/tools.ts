@@ -45,7 +45,7 @@ import {
 } from 'livetennisapi';
 import { z } from 'zod';
 
-export const VERSION = '1.3.0';
+export const VERSION = '1.3.1';
 
 /** Options accepted by `livetennisTools()` and by every individual tool factory. */
 export interface LiveTennisToolOptions {
