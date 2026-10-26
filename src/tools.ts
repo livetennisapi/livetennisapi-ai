@@ -1,5 +1,5 @@
 /**
- * The 24 Live Tennis API tools, as Vercel AI SDK tools.
+ * The 25 Live Tennis API tools, as Vercel AI SDK tools.
  *
  * These are a deliberate port of the MCP server's tools
  * (`livetennisapi-mcp/src/server.ts`) — same names, same descriptions, same
@@ -17,9 +17,11 @@
  *
  * Failures are VALUES, not exceptions
  * -----------------------------------
- * A tier wall, a rejected key, a missing key and an empty result are all normal
- * states with a clear remedy. `guard()` below turns each into a returned object
- * carrying `ok: false` and an actionable `message`. This is the single most
+ * A tier wall, a rejected key, a missing key, a rate limit and an unknown id are
+ * all normal states with a clear remedy. `guard()` below turns each into a
+ * returned object carrying `ok: false` and an actionable `message`. An empty
+ * result is not a failure at all: it comes back as `ok: true` with an empty
+ * list, because "nothing is live right now" is an answer. This is the single most
  * important behaviour inherited from the MCP server: marking a tier wall as an
  * error makes models retry it or abandon the task, instead of relaying the
  * upgrade path to the user, who is the only one who can act on it.
@@ -43,7 +45,7 @@ import {
 } from 'livetennisapi';
 import { z } from 'zod';
 
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 /** Options accepted by `livetennisTools()` and by every individual tool factory. */
 export interface LiveTennisToolOptions {
@@ -82,106 +84,334 @@ type Failure = { ok: false; message: string };
 /** What the closure below hands to each tool: one client, one guard, one key. */
 type Context = {
   apiKey: string;
+  /** Why the configured key cannot be used as it is, or null when it can (or when there is none). */
+  keyProblem: string | null;
   client: LiveTennisAPI;
-  guard: <T extends { ok: boolean; message: string }>(run: () => Promise<T>) => Promise<T | Failure>;
+  guard: <T extends { ok: boolean; message: string }>(
+    schema: z.ZodType<T, z.ZodTypeDef, unknown>,
+    run: () => Promise<T>,
+  ) => Promise<T | Failure>;
+  /** A copy of a result with every occurrence of the API key replaced. */
+  scrub: <T>(value: T) => T;
+  /** The message for anything a client call threw, with the key cut out. */
+  describeFailure: (err: unknown) => string;
 };
+
+/**
+ * Unix epoch seconds as an ISO instant, or null when the value is not one.
+ *
+ * `retry_at_epoch` comes straight out of a 429 body. A string, an object or a
+ * number outside Date's range would make `toISOString()` throw a RangeError, and
+ * a throw from inside the error handler escapes `guard` and the tool with it.
+ */
+function epochToIso(value: unknown): string | null {
+  const seconds = typeof value === 'number' ? value : typeof value === 'string' && value.trim() ? Number(value) : NaN;
+  if (!Number.isFinite(seconds)) return null;
+  const date = new Date(seconds * 1000);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+/** A body field as text for a message, or null when it is not a plain string or number. */
+function scalar(value: unknown): string | null {
+  if (typeof value === 'string') return value.trim() ? value : null;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return null;
+}
+
+/**
+ * True when the key can be sent in an HTTP header as it is. Keys are printable
+ * ASCII with no spaces. Anything else makes fetch reject the request with an
+ * error that quotes the whole header value, key included.
+ */
+const sendableKey = (key: string) => /^[\x21-\x7e]+$/.test(key);
+
+const MALFORMED_KEY =
+  'The configured API key contains a space, a line break or another character that cannot go in ' +
+  'an HTTP header. No request was made. Check the value passed as { apiKey } or set in ' +
+  'LIVETENNISAPI_KEY: a key is one unbroken line of printable characters starting with twjp_. ' +
+  'Keys are at https://livetennisapi.com';
+
+/**
+ * Keys shorter than this are not real keys (they are `twjp_` plus a long
+ * token), and cutting a short string like "ok" out of every text and property
+ * name would wreck the result instead of protecting anything.
+ */
+const MIN_REDACT_LENGTH = 12;
+
+/**
+ * Replace every occurrence of `key` in the strings and property names of a
+ * result, in place, and return it. Iterative, so a deeply nested server object
+ * cannot overflow the stack. Results are built fresh for each call from parsed
+ * JSON, so changing them in place touches nothing the caller holds.
+ */
+function redact<T>(value: T, key: string): T {
+  if (key.length < MIN_REDACT_LENGTH) return value;
+  const clean = (text: string) => (text.includes(key) ? text.split(key).join('[redacted]') : text);
+  if (typeof value === 'string') return clean(value) as T;
+  const seen = new Set<object>();
+  const stack: object[] = [];
+  if (value && typeof value === 'object') stack.push(value);
+  while (stack.length) {
+    const node = stack.pop() as Record<string, unknown> | unknown[];
+    if (seen.has(node)) continue;
+    seen.add(node);
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i += 1) {
+        const item = node[i];
+        if (typeof item === 'string') node[i] = clean(item);
+        else if (item && typeof item === 'object') stack.push(item);
+      }
+      continue;
+    }
+    for (const name of Object.keys(node)) {
+      let item = node[name];
+      if (typeof item === 'string') item = node[name] = clean(item);
+      else if (item && typeof item === 'object') stack.push(item);
+      if (name.includes(key)) {
+        delete node[name];
+        node[clean(name)] = item;
+      }
+    }
+  }
+  return value;
+}
+
+/**
+ * fetch for the client, with one repair. The livetennisapi client formats
+ * `retry_at_epoch` as a date while it builds its AbuseThrottled error. A number
+ * outside the Date range makes that constructor throw a RangeError, and the
+ * 429 body (with its do-not-retry meaning) is lost. For such a body the client
+ * gets a small copy with the fields a 429 is read by, and `retry_at_epoch` as a
+ * string, which the client ignores and `epochToIso` rejects. Unlabelled abuse
+ * and daily 429s get their label (see below). Every other response passes
+ * through untouched.
+ */
+const safeFetch: typeof fetch = async (input, init) => {
+  const res = await globalThis.fetch(input, init);
+  if (res.status !== 429) return res;
+  const rebuild = (body: string) =>
+    new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+  let text = '';
+  try {
+    text = await res.text();
+  } catch {
+    return rebuild('');
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    return rebuild(text);
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return rebuild(text);
+  const b = body as Record<string, unknown>;
+  const badEpoch = typeof b.retry_at_epoch === 'number' && epochToIso(b.retry_at_epoch) === null;
+  // The client stops retrying a 429 only when it says abuse_throttled or
+  // scope "day". A body that only carries retry_at_epoch, or a rate_limited
+  // body with resets_at but no scope, means the same thing to describeFailure,
+  // so it is labelled here and the client does not retry it twice first.
+  const unlabelledAbuse = b.error === undefined && b.scope !== 'day' && b.retry_at_epoch != null;
+  const unlabelledDay =
+    b.scope === undefined && typeof b.resets_at === 'string' && b.resets_at.trim() !== '' && b.error !== 'abuse_throttled';
+  if (!badEpoch && !unlabelledAbuse && !unlabelledDay) return rebuild(text);
+  const small: Record<string, unknown> = {};
+  for (const field of ['error', 'scope', 'limit_per_day', 'resets_at', 'retry_at_epoch']) {
+    const v = b[field];
+    if (typeof v === 'string' || typeof v === 'number') small[field] = v;
+  }
+  if (badEpoch) small.retry_at_epoch = String(b.retry_at_epoch);
+  if (unlabelledAbuse) small.error = 'abuse_throttled';
+  if (unlabelledDay) small.scope = 'day';
+  return rebuild(JSON.stringify(small));
+};
+
+/**
+ * Whether a 403 is the API's plan gate. The client turns every 403 into
+ * UpgradeRequired, including a firewall's HTML page, but the API itself always
+ * says `{"error": "upgrade_required"}`.
+ */
+const isPlanGate = (err: unknown): err is UpgradeRequired =>
+  err instanceof UpgradeRequired && err.errorCode === 'upgrade_required';
+
+/**
+ * Turn anything a client call can throw into the message a tool returns.
+ *
+ * Shared by `guard` and `check_api_status`, so a 429 reads the same whichever
+ * tool hit it. Never throws, and never repeats the API key: `apiKey` is cut out
+ * of any text taken from an error, in case a lower layer quoted it.
+ */
+function describeFailure(err: unknown, apiKey: string): string {
+  if (err instanceof UpgradeRequired) {
+    const code = err.errorCode;
+    if (!isPlanGate(err)) {
+      // A 403 that is not a plan gate (a firewall, a disabled surface). Saying
+      // "upgrade" here would send the user to pay for something that cannot help.
+      const shown = scalar(code);
+      return (
+        `The API refused this request (403${shown ? ` ${redact(shown, apiKey)}` : ''}). ` +
+        'This is not a plan limit. Check the API key and the base URL, or ask hello@livetennisapi.com.'
+      );
+    }
+    const body = err.body && typeof err.body === 'object' ? (err.body as Record<string, unknown>) : {};
+    const taste =
+      body.free_history_taste === 'used'
+        ? ' This API key has already used its 20 free history calls for this calendar month.'
+        : '';
+    const needs = err.requiredTier ? `the ${err.requiredTier} plan` : 'a higher plan';
+    return (
+      `This data requires ${needs}, and the configured API key is on a lower tier.${taste} ` +
+      `Nothing is wrong with the API key. The current plan does not ` +
+      `include this endpoint. Upgrade at https://livetennisapi.com/#pricing\n\n` +
+      `Plans: FREE has live and upcoming matches, scores, players, fixtures and tournaments. ` +
+      `BASIC adds historical results, the results archive (1968 to 2022) and head-to-head. ` +
+      `PRO adds match events, market prices, the rankings listing and player records. ` +
+      `ULTRA adds model analysis, win probability, per-player as-of rankings, in-play statistics, ` +
+      `shot-level charting and the live WebSocket feed.`
+    );
+  }
+  if (err instanceof Unauthorized) {
+    return (
+      'The API key was rejected: it is missing, unknown or disabled. Check the API key passed ' +
+      'to the tool factory or set in LIVETENNISAPI_KEY. Keys are at https://livetennisapi.com'
+    );
+  }
+  if (err instanceof NotFound) {
+    return 'No data found for that request. The id may be wrong, or there may be no data yet.';
+  }
+  if (err instanceof RateLimited) {
+    // Three distinct 429s, each with a different correct reaction. Collapsing
+    // them into "rate limited, retry" makes a model retry through a daily cap
+    // or an abuse block — the one thing that must not happen. Every body field
+    // is checked for type before use: the body is whatever the server sent.
+    const raw = err.body;
+    const body: Record<string, unknown> = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+    // abuse_throttled is named by its error code. A retry_at_epoch decides only
+    // when the body names nothing else: an explicit rate_limited or a daily
+    // scope keeps its own, shorter, meaning.
+    const code = err.errorCode;
+    const abuse =
+      code === 'abuse_throttled' || (code === undefined && body.scope !== 'day' && body.retry_at_epoch != null);
+    if (abuse) {
+      const resumes = epochToIso(body.retry_at_epoch);
+      return (
+        `This API key is temporarily blocked (abuse_throttled). It is a 24-hour block for clients that ` +
+        `keep hammering the API after repeated rate-limit responses.${resumes ? ` Requests resume at ${resumes}.` : ''} ` +
+        `Do NOT retry until then. Fix the retry loop that kept requesting through 429s instead.`
+      );
+    }
+    const resetsAt = typeof body.resets_at === 'string' ? scalar(body.resets_at) : null;
+    if (body.scope === 'day' || resetsAt) {
+      const perDay = typeof body.limit_per_day === 'number' ? scalar(body.limit_per_day) : null;
+      return (
+        `Daily request quota reached for this plan${perDay ? ` (${perDay} requests/day)` : ''}.` +
+        `${resetsAt ? ` The quota resets at ${resetsAt}.` : ''} Retrying before then cannot succeed. ` +
+        `Wait for the reset, or upgrade at https://livetennisapi.com/subscribe/upgrade`
+      );
+    }
+    const wait = err.retryAfter ? ` Retry in about ${err.retryAfter}s.` : '';
+    return `Per-minute rate limit reached for this plan.${wait}`;
+  }
+  if (err instanceof BadRequest && err.errorCode === 'ambiguous_name') {
+    // /h2h, /history/archive/career and /charting/players refuse a fragment
+    // matching more than one player — two people summed into one record
+    // would be a wrong answer, not a convenience. Relay the candidates so
+    // the model can disambiguate instead of retrying blind.
+    const candidates = (err.body as { candidates?: unknown } | undefined)?.candidates;
+    const names = Array.isArray(candidates)
+      ? candidates
+          .map((c) => scalar(c) ?? (c && typeof c === 'object' ? scalar((c as { name?: unknown }).name) : null))
+          .filter((c): c is string => c != null)
+      : [];
+    return (
+      `That name fragment matches more than one player.${names.length ? ` Candidates: ${names.join(', ')}.` : ''} ` +
+      'The API refuses to sum two people into one record, so nothing was guessed. ' +
+      'Retry with a more specific name (one of the candidates above).'
+    );
+  }
+  if (err instanceof BadRequest && err.errorCode === 'doubles_not_supported') {
+    // player_stats covers singles only. The remedy is a different id, not a
+    // retry, so it is a value with that remedy, as an ambiguous name is.
+    return 'That id is a doubles team. Player stats cover singles only, so query each member player id instead.';
+  }
+  // A genuine fault. The MCP server flags these with `isError: true`, which
+  // has no AI SDK equivalent other than throwing — and a throw out of
+  // `execute` can abort the caller's whole generation over one bad request.
+  // So it stays a value here, distinguishable by the message prefix.
+  const text = err instanceof Error ? err.message : String(err);
+  return `Request failed: ${redact(text, apiKey)}`;
+}
 
 /** Build the per-key context every tool in a set shares. */
 export function createContext(options: LiveTennisToolOptions = {}): Context {
   const apiKey = (options.apiKey ?? env('LIVETENNISAPI_KEY') ?? '').trim();
+  const keyProblem = apiKey && !sendableKey(apiKey) ? MALFORMED_KEY : null;
   const baseUrl = options.baseUrl ?? env('LIVETENNISAPI_BASE_URL');
-  const client = new LiveTennisAPI({ apiKey, baseUrl });
+  // A key that cannot go in a header never reaches the client: every request
+  // would fail with the key quoted in the error. check_api_status still runs
+  // its keyless health check and reports the problem.
+  const client = new LiveTennisAPI({ apiKey: keyProblem ? '' : apiKey, baseUrl, fetch: safeFetch });
 
   const fail = (message: string): Failure => ({ ok: false, message });
 
-  async function guard<T extends { ok: boolean; message: string }>(run: () => Promise<T>): Promise<T | Failure> {
+  const scrub = <T,>(value: T): T => redact(value, apiKey);
+
+  async function guard<T extends { ok: boolean; message: string }>(
+    schema: z.ZodType<T, z.ZodTypeDef, unknown>,
+    run: () => Promise<T>,
+  ): Promise<T | Failure> {
     if (!apiKey) {
       return fail(
         'No API key configured. Pass { apiKey } to the tool factory, or set LIVETENNISAPI_KEY in ' +
           'the environment. Get a free key, no card, at https://livetennisapi.com/subscribe/free',
       );
     }
+    if (keyProblem) return fail(keyProblem);
+    let result: T;
     try {
-      return await run();
+      result = await run();
     } catch (err) {
-      if (err instanceof UpgradeRequired) {
-        return fail(
-          `This data requires the ${err.requiredTier ?? 'a higher'} plan, and the configured ` +
-            `API key is on a lower tier. Nothing is wrong with the key — the endpoint is ` +
-            `simply not included in the current plan. Upgrade at https://livetennisapi.com/#pricing\n\n` +
-            `Tiers: FREE = live & upcoming matches, scores, players, fixtures, tournaments · ` +
-            `BASIC = + historical results, the results archive (1968–2022) and head-to-head · ` +
-            `PRO = + match events, market prices and the rankings listing · ` +
-            `ULTRA = + model analysis, win probability, per-player as-of rankings, in-play statistics, ` +
-            `shot-level charting and the live WebSocket feed.`,
-        );
-      }
-      if (err instanceof Unauthorized) {
-        return fail(
-          'The API key was rejected — it is missing, unknown, or disabled. Check the key passed ' +
-            'to the tool factory or set in LIVETENNISAPI_KEY. Keys are at https://livetennisapi.com',
-        );
-      }
-      if (err instanceof NotFound) {
-        return fail('No data found for that request. The id may be wrong, or there may be no data yet.');
-      }
-      if (err instanceof RateLimited) {
-        // Three distinct 429s, each with a different correct reaction. Collapsing
-        // them into "rate limited, retry" makes a model retry through a daily cap
-        // or an abuse block — the one thing that must not happen.
-        const body = err.body as
-          | { error?: string; scope?: string; limit_per_day?: number; resets_at?: string; retry_at_epoch?: number }
-          | undefined;
-        if (err.errorCode === 'abuse_throttled' || body?.retry_at_epoch != null) {
-          const resumes = body?.retry_at_epoch != null ? new Date(body.retry_at_epoch * 1000).toISOString() : null;
-          return fail(
-            `This key is temporarily blocked (abuse_throttled) — a 24-hour block applied to clients that ` +
-              `keep hammering the API after repeated rate-limit responses.${resumes ? ` Requests resume at ${resumes}.` : ''} ` +
-              `Do NOT retry until then; fix the retry loop that kept requesting through 429s instead.`,
-          );
-        }
-        if (body?.scope === 'day' || body?.resets_at) {
-          return fail(
-            `Daily request quota reached for this plan${body?.limit_per_day != null ? ` (${body.limit_per_day} requests/day)` : ''}.` +
-              `${body?.resets_at ? ` The quota resets at ${body.resets_at}.` : ''} Retrying before then cannot succeed — ` +
-              `wait for the reset, or upgrade at https://livetennisapi.com/subscribe/upgrade`,
-          );
-        }
-        const wait = err.retryAfter ? ` Retry in about ${err.retryAfter}s.` : '';
-        return fail(`Per-minute rate limit reached for this plan.${wait}`);
-      }
-      if (err instanceof BadRequest && err.errorCode === 'ambiguous_name') {
-        // /h2h, /history/archive/career and /charting/players refuse a fragment
-        // matching more than one player — two people summed into one record
-        // would be a wrong answer, not a convenience. Relay the candidates so
-        // the model can disambiguate instead of retrying blind.
-        const candidates = (err.body as { candidates?: unknown } | undefined)?.candidates;
-        const list = Array.isArray(candidates) ? candidates.join(', ') : '';
-        return fail(
-          `That name fragment matches more than one player${list ? `: ${list}` : ''}. ` +
-            'The API refuses to sum two people into one record, so nothing was guessed — ' +
-            'retry with a more specific name (one of the candidates above).',
-        );
-      }
-      // A genuine fault. The MCP server flags these with `isError: true`, which
-      // has no AI SDK equivalent other than throwing — and a throw out of
-      // `execute` can abort the caller's whole generation over one bad request.
-      // So it stays a value here, distinguishable by the message prefix.
-      return fail(`Request failed: ${err instanceof Error ? err.message : String(err)}`);
+      return scrub(fail(describeFailure(err, apiKey)));
     }
+    // The last two checks before a result leaves the package. The server shapes
+    // some objects freely, so a result is parsed against the schema the tool
+    // advertises: the AI SDK checks saved outputs against it when a chat is
+    // reloaded (validateUIMessages), and one stray value would break that chat.
+    // And no string in it may carry the key, even if the server echoed it.
+    const parsed = schema.safeParse(result);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      const where = issue?.path.length ? issue.path.join('.') : 'the result';
+      // The path can hold record keys the server chose, so it is scrubbed too.
+      return scrub(
+        fail(
+          `Request failed: the API answered, but ${where} was not in the expected shape. ` +
+            'Retrying will not help. Report it at https://github.com/livetennisapi/livetennisapi-ai/issues',
+        ),
+      );
+    }
+    return scrub(result);
   }
 
-  return { apiKey, client, guard };
+  return {
+    apiKey,
+    keyProblem,
+    client,
+    guard,
+    scrub,
+    describeFailure: (err: unknown) => describeFailure(err, apiKey),
+  };
 }
 
 // -- shared field definitions --------------------------------------------------
-// Declared once so all 24 tools describe the same concept the same way.
+// Declared once so all 25 tools describe the same concept the same way.
 
 const okField = z
   .boolean()
   .describe(
-    'True when the call returned data. False for a tier wall, a missing or rejected key, ' +
-      'or an empty result — all of which are normal states with a clear remedy, not failures.',
+    'True when the request succeeded, including when the answer is an empty list. False for a ' +
+      'missing or rejected key, a plan that does not include this data, an unknown id, a rate ' +
+      'limit or a network error. The message then says what to do. check_api_status is the ' +
+      'exception: it is true whenever the API answered, and reports API key problems in the message.',
   );
 
 const messageField = z
@@ -200,16 +430,20 @@ const MatchOut = z.object({
     .nullable()
     .describe('atp, wta, challenger, itf or juniors. Null when the feed never stated one (exhibitions, team events).'),
   tournament: z.string().nullable().describe('Event name, e.g. "Wimbledon".'),
-  tournament_id: z.string().nullable().describe('Stable tournament id — pass to get_tournament. Null where uncatalogued.'),
+  tournament_id: z.string().nullable().describe('Stable tournament id. Pass to get_tournament. Null where uncatalogued.'),
   round: z.string().nullable().describe('Round within the event, e.g. "QF".'),
   round_code: z
     .string()
     .nullable()
-    .describe('Round in the normalized vocabulary (F, SF, QF, R16 … Q); null when the label is unrecognised, never guessed.'),
+    .describe('Round in the normalized vocabulary (F, SF, QF, R16 ... Q). Null when the label is unrecognised, never guessed.'),
   player1: z.string().nullable().describe('Name of player 1.'),
   player2: z.string().nullable().describe('Name of player 2.'),
   score: z.string().nullable().describe('Formatted score line, e.g. "6-4 3-6 2-1".'),
-  status: z.string().nullable().describe('One of live, upcoming or completed.'),
+  status: z.string().nullable().describe('One of live, upcoming, completed or cancelled.'),
+  scheduled_time: z
+    .string()
+    .nullable()
+    .describe('Scheduled start, UTC ISO-8601. Null when the feed has not published one.'),
   surface: z.string().nullable().describe('Court surface, e.g. hard, clay, grass.'),
   indoor: z.boolean().nullable().describe('True when played indoors.'),
   serving: z.number().nullable().describe('1 or 2 while a point is in play, otherwise null.'),
@@ -226,7 +460,7 @@ const MatchOut = z.object({
     .nullable()
     .describe(
       'The instant the current event_status was recorded, UTC ISO-8601 (added 2026-08-19). ' +
-        'Null while the status has never changed since the field was introduced — never backfilled.',
+        'Null while the status has never changed since the field was introduced. Never backfilled.',
     ),
   withdrew: z
     .number()
@@ -254,7 +488,7 @@ const MatchOut = z.object({
   win_probability_p1: z
     .number()
     .nullable()
-    .describe('Model probability that player 1 wins, 0-1. Requires the ULTRA plan; null otherwise.'),
+    .describe('Model probability that player 1 wins, 0-1. Requires the ULTRA plan, null otherwise.'),
 });
 
 const PlayerOut = z.object({
@@ -270,7 +504,11 @@ const PlayerOut = z.object({
 });
 
 const FixtureOut = z.object({
-  event_date: z.string().nullable().describe('Scheduled start, ISO timestamp.'),
+  event_date: z.string().nullable().describe('Scheduled date, YYYY-MM-DD.'),
+  start_time: z
+    .string()
+    .nullable()
+    .describe('Scheduled start, UTC ISO-8601. Null until the order of play assigns a time.'),
   tournament: z.string().nullable().describe('Event name.'),
   round: z.string().nullable().describe('Round within the event.'),
   player1: z.string().nullable().describe('Name of player 1.'),
@@ -286,20 +524,20 @@ const PriceOut = z.object({
 });
 
 const TournamentOut = z.object({
-  id: z.string().nullable().describe('Stable tournament id — the same id match objects carry as tournament_id.'),
+  id: z.string().nullable().describe('Stable tournament id, the same id match objects carry as tournament_id.'),
   name: z.string().nullable().describe('Tournament name.'),
   tour: z.string().nullable().describe('atp, wta, challenger, itf or juniors.'),
   surface: z.string().nullable().describe('Court surface: hard, clay or grass.'),
   indoor: z.boolean().nullable().describe('True when played indoors.'),
-  city: z.string().nullable().describe('Host city, from a curated table — null where not curated.'),
-  country: z.string().nullable().describe('Host country, ISO-3166 alpha-2 — null where not curated.'),
+  city: z.string().nullable().describe('Host city, from a curated table. Null where not curated.'),
+  country: z.string().nullable().describe('Host country, ISO-3166 alpha-2. Null where not curated.'),
   category: z
     .string()
     .nullable()
     .describe(
       'Tournament category (grand_slam, masters_1000, tour_finals, atp_500, atp_250, wta_1000, ' +
         'wta_500, wta_250, wta_125, challenger, itf, juniors). Set only where the catalogues agree ' +
-        'unambiguously — null otherwise, never derived from the name.',
+        'unambiguously. Null otherwise, never derived from the name.',
     ),
 });
 
@@ -311,21 +549,21 @@ const ArchiveSideOut = z.object({
   player_id: z
     .number()
     .nullable()
-    .describe('Corpus person id — pass to search_archive_players results to join bios. NOT a roster player id.'),
+    .describe('Corpus person id. Join it to search_archive_players results for bios. NOT a roster player id.'),
   hand: z.string().nullable().describe('"R" or "L".'),
   height_cm: z.number().nullable().describe('Height in cm, where recorded.'),
   age: z.number().nullable().describe('Age at the time of the match.'),
-  entry: z.string().nullable().describe('Draw entry where recorded (WC, Q, LL, …) — null for direct acceptances.'),
+  entry: z.string().nullable().describe('Draw entry where recorded (WC, Q, LL, ...). Null for direct acceptances.'),
 });
 
 const ArchiveMatchOut = z.object({
   id: z.number().nullable().describe('Archive match id. Pass to get_archive_match for the detail read with stats.'),
-  tour: z.string().nullable().describe('atp or wta — the results archive covers those two tours.'),
+  tour: z.string().nullable().describe('atp or wta. The results archive covers those two tours.'),
   tournament: z.string().nullable().describe('Tournament name.'),
   event_date: z
     .string()
     .nullable()
-    .describe('The tournament START date — per-match dates do not exist in this era’s records.'),
+    .describe("The tournament START date. Per-match dates do not exist in this era's records."),
   round: z.string().nullable().describe('Round code: F, SF, QF, R16 … Q1-Q4.'),
   level: z.string().nullable().describe('Source tier code: G, M, A, F, D, C, O, or a futures category code.'),
   surface: z.string().nullable().describe('Court surface.'),
@@ -333,8 +571,8 @@ const ArchiveMatchOut = z.object({
   outcome: z
     .string()
     .nullable()
-    .describe('completed, retired, walkover, default or abandoned — parsed, null when unparseable.'),
-  winner: ArchiveSideOut.describe('The winner — a stored field in the corpus, never an inference.'),
+    .describe('completed, retired, walkover, default or abandoned. Parsed, null when unparseable.'),
+  winner: ArchiveSideOut.describe('The winner, a stored field in the corpus, never an inference.'),
   loser: ArchiveSideOut.describe('The loser.'),
 });
 
@@ -342,14 +580,14 @@ const ArchiveBioOut = z.object({
   id: z
     .number()
     .nullable()
-    .describe('Corpus person id — the id archive match rows carry as winner/loser player_id. NOT a roster id.'),
+    .describe('Corpus person id, the id archive match rows carry as winner/loser player_id. NOT a roster id.'),
   tour: z.string().nullable().describe('atp or wta.'),
   name: z.string().nullable().describe('Player name.'),
   hand: z.string().nullable().describe('"R" or "L".'),
   dob: z.string().nullable().describe('Date of birth, ISO date.'),
   country: z.string().nullable().describe('3-letter country code.'),
   height_cm: z.number().nullable().describe('Height in cm.'),
-  career_high_rank: z.number().nullable().describe('Career-high rank, from the corpus’s own weekly tables.'),
+  career_high_rank: z.number().nullable().describe("Career-high rank, from the corpus's own weekly tables."),
   career_high_date: z.string().nullable().describe('The earliest week the career-high rank was reached.'),
 });
 
@@ -362,24 +600,24 @@ const H2HMeetingOut = z.object({
   tournament: z.string().nullable().describe('Tournament name.'),
   round: z.string().nullable().describe('Round.'),
   surface: z.string().nullable().describe('Court surface.'),
-  score: z.string().nullable().describe('Final score (archive rows only — read current rows from get_match).'),
-  outcome: z.string().nullable().describe('completed, retired, walkover, … — exclude non-completed yourself if needed.'),
+  score: z.string().nullable().describe('Final score (archive rows only. Read current rows from get_match).'),
+  outcome: z.string().nullable().describe('completed, retired, walkover, ... Exclude non-completed yourself if needed.'),
   winner: z
     .number()
     .nullable()
     .describe('1 or 2 OF THE REQUEST (player1/player2 as you passed them), not of the underlying match row.'),
-  match_id: z.number().nullable().describe('Our match id (current era rows) — pass to get_match.'),
+  match_id: z.number().nullable().describe('Our match id (current era rows). Pass to get_match.'),
 });
 
 const RankingRowOut = z.object({
-  player_id: z.number().nullable().describe('Roster player id — null on listing rows for players outside our roster.'),
+  player_id: z.number().nullable().describe('Roster player id. Null on listing rows for players outside our roster.'),
   player_name: z.string().nullable().describe('Name as the ranking publisher printed it (listing rows).'),
   system: z.string().nullable().describe('atp, wta, itf_jt, itf_mt, itf_wt or utr. Systems are never comparable.'),
   rank: z.number().nullable().describe('Null for UTR (a rating, not a ranking).'),
   points: z.number().nullable().describe('Null for UTR.'),
-  previous_rank: z.number().nullable().describe('Rank at the preceding snapshot week (ATP/WTA only; null elsewhere).'),
+  previous_rank: z.number().nullable().describe('Rank at the preceding snapshot week (ATP/WTA only, null elsewhere).'),
   rank_movement: z.number().nullable().describe("The circuit's own signed weekly movement (ITF systems only)."),
-  rating: z.number().nullable().describe('UTR only; null elsewhere.'),
+  rating: z.number().nullable().describe('UTR only, null elsewhere.'),
   effective_date: z.string().nullable().describe('The publication week this record took effect, YYYY-MM-DD.'),
 });
 
@@ -394,7 +632,7 @@ const StatsSideOut = z.object({
     .record(z.number().nullable())
     .nullable()
     .describe(
-      'Counted upstream — aces, double_faults, the serve split, winners/unforced errors where covered. ' +
+      'Counted upstream: aces, double_faults, the serve split, winners/unforced errors where covered. ' +
         'Absent fields are omitted, never zero-filled. Quantities named in both families are computed two ' +
         'different ways: a cross-check, not a duplication.',
     ),
@@ -403,32 +641,111 @@ const StatsSideOut = z.object({
 /** Normalise `undefined` to `null` — the schemas above are nullable, not optional. */
 const n = <T,>(v: T | undefined | null): T | null => (v == null ? null : v);
 
+/** A finite number, or null. For fields copied from objects the server shapes freely. */
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+/** A string, or null. */
+const str = (v: unknown): string | null => (typeof v === 'string' ? v : null);
+/** A boolean, or null. The string "false" is not false, and must not read as true either. */
+const bool = (v: unknown): boolean | null => (typeof v === 'boolean' ? v : null);
+
+/**
+ * Only the numeric (or null) entries of a server object, or null when it is not
+ * an object. Stat blocks are passed through by key, and one extra string field
+ * would break the declared `record(number | null)` schema. The AI SDK checks
+ * saved tool outputs against that schema when a chat is reloaded
+ * (`validateUIMessages`), so a stray field fails there.
+ */
+function numRecord(v: unknown): Record<string, number | null> | null {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  const out: Record<string, number | null> = {};
+  for (const [k, x] of Object.entries(v)) if (x === null || num(x) !== null) out[k] = x === null ? null : (x as number);
+  return out;
+}
+
+/** A plain server object, or null for anything else (an array, a string, null). */
+const plainObject = (v: unknown): Record<string, unknown> | null =>
+  v && typeof v === 'object' && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+
+/** One W/L row of player_stats, each field read by type, or null when the row is not an object. */
+function winLossOut(v: unknown): z.infer<typeof WinLossOut> | null {
+  const row = plainObject(v);
+  if (!row) return null;
+  return { matches: num(row.matches), wins: num(row.wins), losses: num(row.losses), win_pct: num(row.win_pct) };
+}
+
+/** A player_stats W/L table by key (surface, venue, level, season). Rows that are not objects are dropped. */
+function winLossRecord(v: unknown): Record<string, z.infer<typeof WinLossOut>> | null {
+  const table = plainObject(v);
+  if (!table) return null;
+  // fromEntries, not assignment: a "__proto__" key from JSON.parse would set
+  // the prototype of a plain object instead of adding a row.
+  return Object.fromEntries(
+    Object.entries(table).flatMap(([k, row]) => {
+      const wl = winLossOut(row);
+      return wl ? [[k, wl] as const] : [];
+    }),
+  );
+}
+
+/** "56-2 (96.6%)", or "no matches" on an empty sample. */
+function winLossLine(wl: z.infer<typeof WinLossOut> | null): string {
+  if (!wl || !wl.matches) return 'no matches';
+  return `${wl.wins ?? 0}-${wl.losses ?? 0}${wl.win_pct != null ? ` (${wl.win_pct}%)` : ''}`;
+}
+
+/**
+ * A player_stats recent-match score from the player's side, "6-4 3-6 6-2", or
+ * null when the server held no score row. Games come as [[player], [opponent]],
+ * and each value may be null, which reads as "?".
+ */
+function sideScore(score: unknown): string | null {
+  const games = plainObject(score)?.games;
+  if (!Array.isArray(games) || games.length !== 2 || !Array.isArray(games[0])) return null;
+  const mine = games[0] as unknown[];
+  const theirs = Array.isArray(games[1]) ? (games[1] as unknown[]) : [];
+  if (!mine.length) return null;
+  return mine.map((v, i) => `${num(v) ?? '?'}-${num(theirs[i]) ?? '?'}`).join(' ');
+}
+
+/** A W-L table by key (surface, level), each row reduced to two numbers. */
+function wlRecord(v: unknown): Record<string, { wins: number | null; losses: number | null }> | null {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return null;
+  return Object.fromEntries(
+    Object.entries(v).map(([k, wl]) => {
+      const row = (wl && typeof wl === 'object' ? wl : {}) as { wins?: unknown; losses?: unknown };
+      return [k, { wins: num(row.wins), losses: num(row.losses) }];
+    }),
+  );
+}
+
 function matchOut(m: Match): z.infer<typeof MatchOut> {
+  // Every field read by type rather than passed through: match rows are the
+  // most common output, and one odd value would otherwise fail the whole list
+  // at the schema check in guard().
   return {
-    id: n(m.id),
-    tour: n(m.tour),
-    tournament: n(m.tournament),
-    tournament_id: n(m.tournament_id),
-    round: n(m.round),
-    round_code: n(m.round_code),
-    player1: n(m.players?.p1?.name),
-    player2: n(m.players?.p2?.name),
-    score: n(formatScore(m.score)),
-    status: n(m.status),
-    surface: n(m.surface),
-    indoor: n(m.indoor),
-    serving: n(m.score?.server),
-    winner: n(m.winner),
-    event_status: n(m.event_status),
-    // Typed in livetennisapi >= 1.5; until this repo's pin moves it is only
-    // reachable through the Extensible index signature, hence the cast.
-    event_status_updated_at: n(m.event_status_updated_at as string | null | undefined),
-    withdrew: n(m.withdrew),
-    // Typed in livetennisapi >= 1.9; until this repo's pin moves they are only
-    // reachable through the Extensible index signature, hence the casts.
-    has_analysis: n(m.has_analysis as boolean | undefined),
-    has_market: n(m.has_market as boolean | undefined),
-    win_probability_p1: n(m.score?.win_probability_p1),
+    id: num(m.id),
+    tour: str(m.tour),
+    tournament: str(m.tournament),
+    tournament_id: str(m.tournament_id),
+    round: str(m.round),
+    round_code: str(m.round_code),
+    player1: str(m.players?.p1?.name),
+    player2: str(m.players?.p2?.name),
+    score: str(formatScore(m.score)),
+    status: str(m.status),
+    scheduled_time: str(m.scheduled_time),
+    surface: str(m.surface),
+    indoor: bool(m.indoor),
+    serving: num(m.score?.server),
+    winner: num(m.winner),
+    event_status: str(m.event_status),
+    // Typed in livetennisapi >= 1.5 and >= 1.9. With the ^1.4.0 floor these are
+    // only reachable through the Extensible index signature.
+    event_status_updated_at: str(m.event_status_updated_at),
+    withdrew: num(m.withdrew),
+    has_analysis: bool(m.has_analysis),
+    has_market: bool(m.has_market),
+    win_probability_p1: num(m.score?.win_probability_p1),
   };
 }
 
@@ -481,7 +798,7 @@ function summariseArchive(m: ArchiveMatch): string {
   const l = m.loser?.name ?? '?';
   const rank = (p: ArchiveParticipant | undefined) => (p?.rank != null ? ` (rank ${p.rank})` : '');
   const bits = [
-    `[${m.id}] ${m.event_date ?? '?'} ${m.tournament ?? 'Unknown event'}${m.round ? ` — ${m.round}` : ''}`,
+    `[${m.id}] ${m.event_date ?? '?'} ${m.tournament ?? 'Unknown event'}${m.round ? `, ${m.round}` : ''}`,
     `  ${w}${rank(m.winner)} d. ${l}${rank(m.loser)}  ${m.score ?? ''}`.trimEnd(),
   ];
   if (m.surface) bits.push(`  Surface: ${m.surface}`);
@@ -523,21 +840,22 @@ function summarise(match: Match): string {
   const serving = match.score?.server === 1 ? ' (serving)' : '';
   const serving2 = match.score?.server === 2 ? ' (serving)' : '';
   const bits = [
-    `[${match.id}] ${match.tournament ?? 'Unknown event'}${match.round ? ` — ${match.round}` : ''}` +
+    `[${match.id}] ${match.tournament ?? 'Unknown event'}${match.round ? `, ${match.round}` : ''}` +
       `${match.tour ? ` · ${match.tour}` : ''}`,
     `  ${p1}${serving} vs ${p2}${serving2}`,
     `  Score: ${formatScore(match.score)}`,
   ];
   if (match.surface) bits.push(`  Surface: ${match.surface}${match.indoor ? ' (indoor)' : ''}`);
   if (match.status && match.status !== 'live') bits.push(`  Status: ${match.status}`);
+  if (match.status === 'upcoming' && match.scheduled_time) bits.push(`  Starts: ${match.scheduled_time}`);
   if (match.winner) bits.push(`  Winner: ${match.winner === 1 ? p1 : p2}`);
   if (match.event_status) {
     bits.push(`  Event status: ${match.event_status}${match.withdrew ? ` (player ${match.withdrew} withdrew)` : ''}`);
   }
   // Only when the server sent them (added 2026-09-02) — an older server omits
   // both, and the summary must not invent a coverage claim.
-  const hasAnalysis = match.has_analysis as boolean | undefined;
-  const hasMarket = match.has_market as boolean | undefined;
+  const hasAnalysis = bool(match.has_analysis);
+  const hasMarket = bool(match.has_market);
   if (hasAnalysis != null) bits.push(`  Analysis: ${hasAnalysis ? 'available' : 'none'}`);
   if (hasMarket != null) bits.push(`  Market: ${hasMarket ? 'mapped' : 'none'}`);
   if (match.score?.win_probability_p1 != null) {
@@ -562,31 +880,33 @@ const tourField = z
   .enum(['atp', 'wta', 'challenger', 'itf', 'juniors'])
   .optional()
   .describe(
-    'Tour filter; each name covers its doubles variants. Exhibition/team events carry no tour and are ' +
+    'Tour filter. Each name covers its doubles variants. Exhibition/team events carry no tour and are ' +
       'excluded whenever the filter is used.',
   );
 const playerFilterField = z
   .array(z.number().int())
   .max(50)
   .optional()
-  .describe('Player ids (from search_players), max 50 — keeps matches where ANY listed player is either participant.');
+  .describe('Player ids (from search_players), max 50. Keeps matches where ANY listed player is either participant.');
 const countryField = z
   .string()
   .length(3)
   .optional()
   .describe(
-    "Either participant's country — the lowercase 3-letter IOC-style code the Player object returns " +
+    "Either participant's country: the lowercase 3-letter IOC-style code the Player object returns " +
       '(e.g. ned, sui, gre), NOT ISO-3166. Players with no recorded country never match.',
   );
 const fromField = z.string().optional().describe('Earliest play date: YYYY-MM-DD (a whole UTC day) or ISO-8601 datetime.');
-const toField = z.string().optional().describe('Latest play date: YYYY-MM-DD or ISO-8601; must not precede from.');
+const toField = z.string().optional().describe('Latest play date: YYYY-MM-DD or ISO-8601. Must not precede from.');
 
 // -- output schemas ------------------------------------------------------------
 // Named rather than inlined so each tool's `execute` can be annotated with its
 // own return type. That annotation is what makes TypeScript enforce that the
-// value a tool returns actually matches the schema it advertises — the AI SDK
-// does NOT validate tool output at runtime, so this is the only thing standing
-// between a schema and the data drifting apart.
+// value a tool returns actually matches the schema it advertises. The AI SDK
+// does not validate tool output when `execute` returns. It does when an app
+// reloads a saved chat through `validateUIMessages`, so an output that drifts
+// from its schema breaks there, long after the call. Server objects copied by
+// key go through numRecord/wlRecord for the same reason.
 
 const LiveMatchesOutput = outputOf({
   matches: z.array(MatchOut).optional().describe('The live matches, most relevant first.'),
@@ -604,14 +924,14 @@ const MatchOutput = outputOf({
       prices: z.array(PriceOut).describe('Current prices per player.'),
     })
     .optional()
-    .describe('Match-winner market. Requires the PRO plan; absent otherwise.'),
+    .describe('Match-winner market. Requires the PRO plan, absent otherwise.'),
   analysis: z
     .object({
       win_probability_p1: z.number().nullable().describe('Model probability player 1 wins, 0-1.'),
       key_factors: z.array(z.string()).describe('Drivers behind the model view.'),
     })
     .optional()
-    .describe('Model analysis. Requires the ULTRA plan; absent otherwise.'),
+    .describe('Model analysis. Requires the ULTRA plan, absent otherwise.'),
 });
 
 const MatchScoreOutput = outputOf({
@@ -653,7 +973,7 @@ const MatchEventsOutput = outputOf({
       }),
     )
     .optional()
-    .describe('Events in chronological order.'),
+    .describe('Events, newest first, as the API returns them.'),
 });
 
 const MatchOddsOutput = outputOf({
@@ -766,7 +1086,7 @@ const ArchiveCareerOutput = outputOf({
     .nullable()
     .optional()
     .describe(
-      'Summed serve stats + derived ratios. matches_with_stats states the coverage; ratios are null where ' +
+      'Summed serve stats + derived ratios. matches_with_stats states the coverage. Ratios are null where ' +
         'the denominator is zero.',
     ),
 });
@@ -779,25 +1099,87 @@ const H2HOutput = outputOf({
     })
     .nullable()
     .optional()
-    .describe('The resolved names; null when no player matches the fragments.'),
+    .describe('The resolved names. Null when no player matches the fragments.'),
   totals: z
     .object({
       p1_wins: z.number().nullable().describe('Wins for player1 (of the request).'),
       p2_wins: z.number().nullable().describe('Wins for player2 (of the request).'),
       meetings: z.number().nullable().describe('Meetings with a known winner.'),
-      undecided: z.number().nullable().describe('Meetings with no derivable winner — never counted in wins.'),
+      undecided: z.number().nullable().describe('Meetings with no derivable winner. Never counted in wins.'),
     })
     .optional()
     .describe('The headline record.'),
   by_surface: z
     .record(z.object({ p1: z.number().nullable(), p2: z.number().nullable() }))
     .optional()
-    .describe('Decided wins per surface; keys are surface names plus "unknown".'),
+    .describe('Decided wins per surface. The keys are surface names plus "unknown".'),
   meetings: z.array(H2HMeetingOut).optional().describe('Individual meetings, newest first, capped at 200.'),
 });
 
 const RankingsOutput = outputOf({
   rankings: z.array(RankingRowOut).optional().describe('The table in rank order.'),
+});
+
+const WinLossOut = z.object({
+  matches: z.number().nullable().describe('Matches in the sample.'),
+  wins: z.number().nullable().describe('Wins.'),
+  losses: z.number().nullable().describe('Losses.'),
+  win_pct: z.number().nullable().describe('Win percentage, one decimal; null (never 0) on an empty sample.'),
+});
+
+const PlayerStatsOutput = outputOf({
+  player: z
+    .object({ id: z.number().nullable(), name: z.string().nullable() })
+    .optional()
+    .describe('The player.'),
+  window: z
+    .object({ from: z.string().nullable(), to: z.string().nullable() })
+    .optional()
+    .describe('The window applied, UTC.'),
+  overall: WinLossOut.nullable().optional().describe('W/L over the window.'),
+  last_12_months: WinLossOut.nullable().optional().describe('W/L over the 12 months ending at the window end.'),
+  by_surface: z.record(WinLossOut).nullable().optional().describe('W/L keyed hard, clay, grass, unknown.'),
+  by_venue: z.record(WinLossOut).nullable().optional().describe('W/L keyed indoor, outdoor, unknown.'),
+  by_level: z.record(WinLossOut).nullable().optional().describe('W/L keyed by match tour, or unknown.'),
+  by_season: z.record(WinLossOut).nullable().optional().describe('W/L keyed by UTC calendar year.'),
+  sets: z
+    .record(z.unknown())
+    .nullable()
+    .optional()
+    .describe(
+      'Set-based record: sample, tiebreaks, deciding_sets, after_winning_first_set, ' +
+        'after_losing_first_set, comebacks, sets.',
+    ),
+  withdrawals: z
+    .record(z.unknown())
+    .nullable()
+    .optional()
+    .describe('Retired / walkover / default, each as given (this player) and received (the opponent).'),
+  recent: z
+    .array(
+      z.object({
+        match_id: z.number().nullable().describe('Match id. Pass to get_match.'),
+        date: z.string().nullable().describe('Match date.'),
+        tournament: z.string().nullable().describe('Event name.'),
+        round: z.string().nullable().describe('Round.'),
+        surface: z.string().nullable().describe('Court surface.'),
+        opponent: z.string().nullable().describe('Opponent name.'),
+        opponent_id: z.number().nullable().describe('Opponent player id.'),
+        won: z.boolean().nullable().describe('True when this player won.'),
+        outcome: z.string().nullable().describe('completed, retired, walkover or default.'),
+        score: z.string().nullable().describe('Final score from this player\'s side, e.g. "6-4 3-6 6-2".'),
+      }),
+    )
+    .optional()
+    .describe('The last N matches, newest first.'),
+  serve_return: z
+    .record(z.unknown())
+    .nullable()
+    .optional()
+    .describe(
+      'ULTRA only, null below: summed serve and return statistics, each ratio as ' +
+        'numerator/denominator/pct with its match count.',
+    ),
 });
 
 const PlayerRankingsOutput = outputOf({
@@ -818,7 +1200,7 @@ const MatchStatisticsOutput = outputOf({
       coverage: z
         .string()
         .nullable()
-        .describe('live | final | stale | none | diverged — summarises the response.'),
+        .describe('live | final | stale | none | diverged. Summarises the response.'),
       as_of: z.string().nullable().describe('When the underlying record was last updated (UTC).'),
       games_counted: z
         .number()
@@ -827,13 +1209,13 @@ const MatchStatisticsOutput = outputOf({
       players: z
         .object({ p1: StatsSideOut.nullable(), p2: StatsSideOut.nullable() })
         .nullable()
-        .describe('Null when coverage is none — the match exists and holding nothing is the honest answer.'),
+        .describe('Null when coverage is none. The match exists, and holding nothing is the honest answer.'),
       freshness: z
         .record(z.any())
         .nullable()
         .describe(
           'Per-family coverage/as_of/age. The two ages use DIFFERENT clocks (derived: against the ' +
-            'newest score row; measured: wall clock) and must not be compared. On diverged the ' +
+            'newest score row, measured: wall clock) and must not be compared. On diverged the ' +
             'measured values are withheld and measured_divergence says why.',
         ),
     })
@@ -848,7 +1230,7 @@ const ChartingPlayerOutput = outputOf({
   families: z
     .record(z.any())
     .optional()
-    .describe("Per-family summed numeric columns — raw sums over the player's charted Total rows."),
+    .describe("Per-family summed numeric columns: raw sums over the player's charted Total rows."),
 });
 
 const ChartingMatchOutput = outputOf({
@@ -868,8 +1250,9 @@ const ChartingMatchOutput = outputOf({
 export const defineGetLiveMatches = (ctx: Context) =>
   tool({
     description:
-      'List tennis matches currently in progress, with live scores. Covers ATP, WTA, ' +
-      'Challenger, ITF and juniors. Use this for "what tennis is on right now".',
+      'List tennis matches currently in progress, with live scores. Covers ATP, WTA, Challenger, ' +
+      'ITF and juniors. Use this for "what tennis is on right now". Works on the FREE plan (no card ' +
+      'needed).',
     inputSchema: z.object({
       tour: tourField,
       player: playerFilterField,
@@ -878,8 +1261,8 @@ export const defineGetLiveMatches = (ctx: Context) =>
     }),
     outputSchema: LiveMatchesOutput,
     execute: ({ tour, player, country, limit }): Promise<z.infer<typeof LiveMatchesOutput>> =>
-      ctx.guard(async () => {
-        const page = await ctx.client.listMatches({ status: 'live', tour, player, country, limit });
+      ctx.guard(LiveMatchesOutput, async () => {
+        const page = await ctx.client.listMatches({ status: 'live', tour, player, country: country?.toLowerCase(), limit });
         if (!page.data.length) {
           return { ok: true as const, message: 'No matches are live right now.', matches: [] };
         }
@@ -893,7 +1276,10 @@ export const defineGetLiveMatches = (ctx: Context) =>
 
 export const defineGetUpcomingMatches = (ctx: Context) =>
   tool({
-    description: 'List tennis matches scheduled to start soon, with players and tournament.',
+    description:
+      'List tennis matches scheduled to start soon, with players, tournament and start time. Use ' +
+      'this for "who plays next" or to find a match id before it starts. Works on the FREE plan (no ' +
+      'card needed).',
     inputSchema: z.object({
       tour: tourField,
       player: playerFilterField,
@@ -904,8 +1290,16 @@ export const defineGetUpcomingMatches = (ctx: Context) =>
     }),
     outputSchema: UpcomingMatchesOutput,
     execute: ({ tour, player, country, from, to, limit }): Promise<z.infer<typeof UpcomingMatchesOutput>> =>
-      ctx.guard(async () => {
-        const page = await ctx.client.listMatches({ status: 'upcoming', tour, player, country, from, to, limit });
+      ctx.guard(UpcomingMatchesOutput, async () => {
+        const page = await ctx.client.listMatches({
+          status: 'upcoming',
+          tour,
+          player,
+          country: country?.toLowerCase(),
+          from,
+          to,
+          limit,
+        });
         if (!page.data.length) {
           return { ok: true as const, message: 'No upcoming matches are scheduled.', matches: [] };
         }
@@ -920,12 +1314,12 @@ export const defineGetUpcomingMatches = (ctx: Context) =>
 export const defineGetMatch = (ctx: Context) =>
   tool({
     description:
-      'Full detail for one match by id: players, score, surface, round and status. ' +
-      'Includes market prices on PRO and model analysis on ULTRA.',
+      'Full detail for one match by id: players, score, surface, round and status. Includes market ' +
+      'prices on PRO and model analysis on ULTRA. Works on the FREE plan (no card needed).',
     inputSchema: z.object({ match_id: matchIdField }),
     outputSchema: MatchOutput,
     execute: ({ match_id }): Promise<z.infer<typeof MatchOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(MatchOutput, async () => {
         const match = await ctx.client.getMatch(match_id);
         if (!match) return { ok: true as const, message: 'No data returned for that match id.' };
         // `message` is assembled alongside the structured fields and written to
@@ -955,7 +1349,7 @@ export const defineGetMatch = (ctx: Context) =>
           if (profile.win_probability_p1 != null) {
             message += `\n  Win probability (player 1): ${(profile.win_probability_p1 * 100).toFixed(1)}%`;
           }
-          if (profile.key_factors?.length) message += `\n  Key factors: ${profile.key_factors.join('; ')}`;
+          if (profile.key_factors?.length) message += `\n  Main factors: ${profile.key_factors.join(' · ')}`;
           out.analysis = {
             win_probability_p1: n(profile.win_probability_p1),
             key_factors: profile.key_factors ?? [],
@@ -969,12 +1363,13 @@ export const defineGetMatch = (ctx: Context) =>
 export const defineGetMatchScore = (ctx: Context) =>
   tool({
     description:
-      'Current score for one match — the fastest, lowest-latency read. Use this when ' +
-      'you only need the score and already know the match id.',
+      'Current score for one match. This is the fastest read, with the lowest latency. Use it when ' +
+      'you only need the score and already know the match id. Works on the FREE plan (no card ' +
+      'needed).',
     inputSchema: z.object({ match_id: matchIdField }),
     outputSchema: MatchScoreOutput,
     execute: ({ match_id }): Promise<z.infer<typeof MatchScoreOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(MatchScoreOutput, async () => {
         const score = await ctx.client.getMatchScore(match_id);
         if (!score) return { ok: true as const, message: 'No score available for that match yet.' };
         const parts = [`Score: ${formatScore(score)}`];
@@ -1001,15 +1396,15 @@ export const defineGetMatchScore = (ctx: Context) =>
 export const defineSearchPlayers = (ctx: Context) =>
   tool({
     description:
-      'Search tennis players by name. Returns id, country, ranking and tour. Use the ' +
-      'returned id with get_player.',
+      'Search tennis players by name. Returns id, country, ranking and tour. Use the returned id ' +
+      'with get_player. Works on the FREE plan (no card needed).',
     inputSchema: z.object({
       query: z.string().min(1).describe('Full or partial player name, e.g. "alcaraz".'),
       limit: limitField(200, 10, 'players'),
     }),
     outputSchema: SearchPlayersOutput,
     execute: ({ query, limit }): Promise<z.infer<typeof SearchPlayersOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(SearchPlayersOutput, async () => {
         const page = await ctx.client.searchPlayers(query, { limit });
         if (!page.data.length) {
           return { ok: true as const, message: `No players matched "${query}".`, players: [] };
@@ -1020,7 +1415,7 @@ export const defineSearchPlayers = (ctx: Context) =>
             .map(
               (p) =>
                 `[${p.id}] ${p.name ?? '?'}${p.country ? ` (${p.country})` : ''}` +
-                `${p.ranking != null ? ` — rank ${p.ranking}` : ''}${p.tour ? ` · ${p.tour}` : ''}`,
+                `${p.ranking != null ? `, rank ${p.ranking}` : ''}${p.tour ? ` · ${p.tour}` : ''}`,
             )
             .join('\n'),
           players: page.data.map((p) => ({
@@ -1040,13 +1435,15 @@ export const defineSearchPlayers = (ctx: Context) =>
 
 export const defineGetPlayer = (ctx: Context) =>
   tool({
-    description: "One player's profile: ranking, country, handedness, date of birth and cached stats.",
+    description:
+      'One player\'s profile: ranking, country, handedness, date of birth and cached stats. Works on ' +
+      'the FREE plan (no card needed).',
     inputSchema: z.object({
       player_id: z.number().int().describe('Player id, as returned by search_players.'),
     }),
     outputSchema: PlayerOutput,
     execute: ({ player_id }): Promise<z.infer<typeof PlayerOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(PlayerOutput, async () => {
         const p = await ctx.client.getPlayer(player_id);
         if (!p) return { ok: true as const, message: 'No data returned for that player id.' };
         const rows = [
@@ -1078,11 +1475,13 @@ export const defineGetPlayer = (ctx: Context) =>
 
 export const defineGetFixtures = (ctx: Context) =>
   tool({
-    description: 'Upcoming scheduled tennis fixtures, earliest first — the forward schedule.',
+    description:
+      'Upcoming scheduled tennis fixtures, earliest first. This is the forward schedule, filterable ' +
+      'by tour. Use this for "what is on this week". Works on the FREE plan (no card needed).',
     inputSchema: z.object({ tour: tourField, limit: limitField(200, 20, 'fixtures') }),
     outputSchema: FixturesOutput,
     execute: ({ tour, limit }): Promise<z.infer<typeof FixturesOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(FixturesOutput, async () => {
         const page = await ctx.client.listFixtures({ tour, limit });
         if (!page.data.length) return { ok: true as const, message: 'No upcoming fixtures.', fixtures: [] };
         return {
@@ -1090,12 +1489,13 @@ export const defineGetFixtures = (ctx: Context) =>
           message: page.data
             .map(
               (f) =>
-                `${f.event_date ?? '?'} — ${f.tournament ?? '?'}` +
+                `${f.start_time ?? f.event_date ?? '?'} · ${f.tournament ?? '?'}` +
                 `${f.round ? ` (${f.round})` : ''}: ${f.player1_name ?? '?'} vs ${f.player2_name ?? '?'}`,
             )
             .join('\n'),
           fixtures: page.data.map((f) => ({
             event_date: n(f.event_date),
+            start_time: n(f.start_time),
             tournament: n(f.tournament),
             round: n(f.round),
             player1: n(f.player1_name),
@@ -1108,8 +1508,9 @@ export const defineGetFixtures = (ctx: Context) =>
 export const defineSearchTournaments = (ctx: Context) =>
   tool({
     description:
-      'Search the tournament catalogue — the stable id space that match objects carry as ' +
-      'tournament_id. Returns surface, indoor, host city/country and category where curated.',
+      'Search the tournament catalogue. Its ids are the tournament_id that match objects carry. ' +
+      'Returns surface, indoor, host city/country and category where curated. Works on the FREE ' +
+      'plan (no card needed).',
     inputSchema: z.object({
       query: z.string().optional().describe('Full or partial tournament name, e.g. "wimbledon". Omit to list all.'),
       tour: z
@@ -1120,7 +1521,7 @@ export const defineSearchTournaments = (ctx: Context) =>
     }),
     outputSchema: TournamentsOutput,
     execute: ({ query, tour, limit }): Promise<z.infer<typeof TournamentsOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(TournamentsOutput, async () => {
         const page = await ctx.client.listTournaments({ search: query, tour, limit });
         if (!page.data.length) {
           return {
@@ -1148,8 +1549,9 @@ export const defineSearchTournaments = (ctx: Context) =>
 export const defineGetTournament = (ctx: Context) =>
   tool({
     description:
-      'One tournament by its stable id — the tournament_id carried on match objects. ' +
-      'Name, tour, surface, indoor, plus host city/country and category where curated.',
+      'One tournament by its stable id, the tournament_id carried on match objects. Name, tour, ' +
+      'surface, indoor, plus host city/country and category where curated. Works on the FREE plan ' +
+      '(no card needed).',
     inputSchema: z.object({
       tournament_id: z
         .string()
@@ -1157,7 +1559,7 @@ export const defineGetTournament = (ctx: Context) =>
     }),
     outputSchema: TournamentOutput,
     execute: ({ tournament_id }): Promise<z.infer<typeof TournamentOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(TournamentOutput, async () => {
         const t = await ctx.client.getTournament(tournament_id);
         if (!t) return { ok: true as const, message: 'No data returned for that tournament id.' };
         const rows = [
@@ -1174,8 +1576,8 @@ export const defineGetTournament = (ctx: Context) =>
 export const defineGetRecentResults = (ctx: Context) =>
   tool({
     description:
-      'Recently completed tennis matches with final scores and winners. Filterable by tour, ' +
-      'player, nationality and play date. Requires the BASIC plan or any History plan.',
+      'Recently completed tennis matches with final scores and winners. Filterable by tour, player, ' +
+      'nationality and play date. Requires the BASIC plan or any History plan.',
     inputSchema: z.object({
       tour: tourField,
       player: playerFilterField,
@@ -1186,8 +1588,15 @@ export const defineGetRecentResults = (ctx: Context) =>
     }),
     outputSchema: RecentResultsOutput,
     execute: ({ tour, player, country, from, to, limit }): Promise<z.infer<typeof RecentResultsOutput>> =>
-      ctx.guard(async () => {
-        const page = await ctx.client.listCompletedMatches({ tour, player, country, from, to, limit });
+      ctx.guard(RecentResultsOutput, async () => {
+        const page = await ctx.client.listCompletedMatches({
+          tour,
+          player,
+          country: country?.toLowerCase(),
+          from,
+          to,
+          limit,
+        });
         if (!page.data.length) {
           return { ok: true as const, message: 'No completed matches available.', matches: [] };
         }
@@ -1202,10 +1611,10 @@ export const defineGetRecentResults = (ctx: Context) =>
 export const defineSearchArchiveMatches = (ctx: Context) =>
   tool({
     description:
-      'Search the results archive — completed-match RESULTS from 1968 through 2022: ATP and WTA, ' +
-      'main draws, qualifying and the ITF/futures tiers. Winner/loser-shaped records with final ' +
-      'score, seeds and ranks AT THE TIME of the match. Use this for historical questions ' +
-      '("Borg\'s Wimbledon finals"); the archive ends 2022-12-31 where our own results ' +
+      'Search the results archive: completed-match RESULTS from 1968 through 2022. ATP and WTA, ' +
+      'main draws, qualifying and the ITF/futures tiers. Each record has winner and loser, final ' +
+      'score, and seeds and ranks AT THE TIME of the match. Use this for historical questions ' +
+      '("Borg\'s Wimbledon finals"). The archive ends 2022-12-31, where our own results ' +
       '(get_recent_results) begin. Requires the BASIC plan or any History plan.',
     inputSchema: z.object({
       player_name: z
@@ -1225,19 +1634,19 @@ export const defineSearchArchiveMatches = (ctx: Context) =>
         .optional()
         .describe(
           'Source tier code: G=grand slam, M=masters, A=tour, F=finals, D=davis cup, C=challenger, ' +
-            'O=olympics, or a futures category code (e.g. 15).',
+            'O=olympics. Or a futures category code (e.g. 15).',
         ),
       limit: limitField(200, 20, 'results'),
     }),
     outputSchema: ArchiveMatchesOutput,
     execute: ({ player_name, tour, from, to, round, level, limit }): Promise<z.infer<typeof ArchiveMatchesOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(ArchiveMatchesOutput, async () => {
         const page = await ctx.client.listArchiveMatches({ name: player_name, tour, from, to, round, level, limit });
         if (!page.data.length) {
           return {
             ok: true as const,
             message:
-              'No archive results matched. The results archive covers 1968 through 2022 — for 2023 ' +
+              'No archive results matched. The results archive covers 1968 through 2022. For 2023 ' +
               'onward use get_recent_results.',
             results: [],
           };
@@ -1253,15 +1662,15 @@ export const defineSearchArchiveMatches = (ctx: Context) =>
 export const defineGetArchiveMatch = (ctx: Context) =>
   tool({
     description:
-      'One result from the results archive (1968–2022), with per-match serve statistics where ' +
-      'the era recorded them — stats are null for most rows before 1991, honestly, never ' +
-      'synthesised. Requires the BASIC plan or any History plan.',
+      'One result from the results archive (1968 to 2022), with per-match serve statistics where ' +
+      'the era recorded them. Stats are null for most rows before 1991, never synthesised. Requires ' +
+      'the BASIC plan or any History plan.',
     inputSchema: z.object({
       archive_match_id: z.number().int().describe('Archive match id, as returned by search_archive_matches.'),
     }),
     outputSchema: ArchiveMatchOutput,
     execute: ({ archive_match_id }): Promise<z.infer<typeof ArchiveMatchOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(ArchiveMatchOutput, async () => {
         const m = await ctx.client.getArchiveMatch(archive_match_id);
         if (!m) return { ok: true as const, message: 'No data returned for that archive match id.' };
         let message = summariseArchive(m);
@@ -1273,11 +1682,11 @@ export const defineGetArchiveMatch = (ctx: Context) =>
             .filter(Boolean)
             .join('\n');
           out.stats = {
-            winner: n(m.stats.winner as Record<string, number | null> | null | undefined),
-            loser: n(m.stats.loser as Record<string, number | null> | null | undefined),
+            winner: numRecord(m.stats.winner),
+            loser: numRecord(m.stats.loser),
           };
         } else {
-          message += '\n\nNo serve statistics — the corpus records them from 1991 only, and this null is honest.';
+          message += '\n\nNo serve statistics. The corpus records them from 1991 only, so this null is honest.';
           out.stats = null;
         }
         out.message = message;
@@ -1288,10 +1697,10 @@ export const defineGetArchiveMatch = (ctx: Context) =>
 export const defineSearchArchivePlayers = (ctx: Context) =>
   tool({
     description:
-      'The people of the results archive (1968–2022): hand, date of birth, country, height, and ' +
-      'career-high rank with the week it was first reached. Their ids are corpus person ids ' +
-      '(the winner/loser player_id on archive results), not roster ids — for current players ' +
-      'use search_players. Requires the BASIC plan or any History plan.',
+      'The people of the results archive (1968 to 2022): hand, date of birth, country, height, and ' +
+      'career-high rank with the week it was first reached. Their ids are corpus person ids (the ' +
+      'winner/loser player_id on archive results), not roster ids. For current players use ' +
+      'search_players. Requires the BASIC plan or any History plan.',
     inputSchema: z.object({
       query: z.string().min(3).describe('Full or partial player name, min 3 chars, e.g. "navratilova".'),
       tour: z.enum(['atp', 'wta']).optional().describe('atp or wta.'),
@@ -1299,7 +1708,7 @@ export const defineSearchArchivePlayers = (ctx: Context) =>
     }),
     outputSchema: ArchivePlayersOutput,
     execute: ({ query, tour, limit }): Promise<z.infer<typeof ArchivePlayersOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(ArchivePlayersOutput, async () => {
         const page = await ctx.client.listArchivePlayers({ name: query, tour, limit });
         if (!page.data.length) {
           return { ok: true as const, message: `No archive players matched "${query}".`, players: [] };
@@ -1332,22 +1741,22 @@ export const defineSearchArchivePlayers = (ctx: Context) =>
 export const defineGetArchiveCareer = (ctx: Context) =>
   tool({
     description:
-      "One player's whole career over the results archive (1968–2022): W-L record overall and by " +
-      'surface/level/year, titles, and summed serve statistics with honest coverage — the corpus ' +
-      'records serve stats from 1991 only, so matches_with_stats states how many matches the serve ' +
-      'block covers. The name must resolve to one person; an ambiguous fragment returns the ' +
-      'candidate list to choose from. Requires the BASIC plan or any History plan.',
+      'One player\'s whole career over the results archive (1968 to 2022). W-L record in total and ' +
+      'by surface/level/year, titles, and summed serve statistics. The corpus records serve stats ' +
+      'from 1991 only, so matches_with_stats says how many matches the serve block covers. The name ' +
+      'must resolve to one person. An ambiguous fragment returns the candidate list to choose from. ' +
+      'Requires the BASIC plan or any History plan.',
     inputSchema: z.object({
-      name: z.string().min(3).describe('Player name fragment, min 3 chars — must resolve to exactly one person.'),
+      name: z.string().min(3).describe('Player name fragment, min 3 chars. Must resolve to exactly one person.'),
     }),
     outputSchema: ArchiveCareerOutput,
     execute: ({ name }): Promise<z.infer<typeof ArchiveCareerOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(ArchiveCareerOutput, async () => {
         const career = await ctx.client.getArchiveCareer(name);
         if (!career) return { ok: true as const, message: 'No archive career found for that name.' };
         const rec = career.record ?? {};
         const lines = [
-          `${career.player?.name ?? name} — results archive (1968–2022)`,
+          `${career.player?.name ?? name}, results archive (1968 to 2022)`,
           `Record: ${rec.wins ?? 0}-${rec.losses ?? 0}, ${rec.titles ?? 0} title(s)` +
             `${career.span?.first ? ` · ${career.span.first} → ${career.span.last ?? '?'}` : ''}`,
         ];
@@ -1367,7 +1776,7 @@ export const defineGetArchiveCareer = (ctx: Context) =>
               `BP saved ${serve.bp_saved_pct ?? '-'}`,
           );
         } else {
-          lines.push('Serve stats: none — the corpus records them from 1991 only.');
+          lines.push('Serve stats: none. The corpus records them from 1991 only.');
         }
         return {
           ok: true as const,
@@ -1375,14 +1784,14 @@ export const defineGetArchiveCareer = (ctx: Context) =>
           player_name: n(career.player?.name),
           span: { first: n(career.span?.first), last: n(career.span?.last) },
           record: {
-            wins: n(rec.wins),
-            losses: n(rec.losses),
-            titles: n(rec.titles),
-            by_surface: n(rec.by_surface as Record<string, { wins: number | null; losses: number | null }> | undefined),
-            by_level: n(rec.by_level as Record<string, { wins: number | null; losses: number | null }> | undefined),
+            wins: num(rec.wins),
+            losses: num(rec.losses),
+            titles: num(rec.titles),
+            by_surface: wlRecord(rec.by_surface),
+            by_level: wlRecord(rec.by_level),
           },
-          by_year: (career.by_year ?? []).map((y) => ({ year: n(y.year), wins: n(y.wins), losses: n(y.losses) })),
-          serve: n(serve as Record<string, number | null> | undefined),
+          by_year: (career.by_year ?? []).map((y) => ({ year: num(y.year), wins: num(y.wins), losses: num(y.losses) })),
+          serve: numRecord(serve),
         };
       }),
   });
@@ -1390,18 +1799,19 @@ export const defineGetArchiveCareer = (ctx: Context) =>
 export const defineGetH2H = (ctx: Context) =>
   tool({
     description:
-      'The all-time record between two players, across BOTH halves of the product: the results ' +
-      'archive (1968–2022) plus our own completed matches (2023 onward). Names are the keys — an ' +
-      'ambiguous fragment returns the candidate list to choose from rather than guessing. Totals ' +
-      'count only meetings with a known winner; walkovers and retirements are part of the record ' +
-      'and each meeting carries its outcome. Requires the BASIC plan or any History plan.',
+      'The all-time record between two players, across BOTH halves of the product. That is the ' +
+      'results archive (1968 to 2022) plus our own completed matches (2023 onward). Names are the ' +
+      'keys. An ambiguous fragment returns the candidate list to choose from, and nothing is ' +
+      'guessed. Totals count only meetings with a known winner. Walkovers and retirements are part ' +
+      'of the record, and each meeting carries its outcome. Requires the BASIC plan or any History ' +
+      'plan.',
     inputSchema: z.object({
       player1: z.string().min(3).describe('First player name (fragment, min 3 chars), e.g. "federer".'),
       player2: z.string().min(3).describe('Second player name (fragment, min 3 chars), e.g. "nadal".'),
     }),
     outputSchema: H2HOutput,
     execute: ({ player1, player2 }): Promise<z.infer<typeof H2HOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(H2HOutput, async () => {
         const h2h = await ctx.client.getH2H(player1, player2);
         if (!h2h || !h2h.players) {
           return {
@@ -1430,7 +1840,7 @@ export const defineGetH2H = (ctx: Context) =>
           for (const m of meetings.slice(0, 20)) {
             const who = m.winner === 1 ? p1 : m.winner === 2 ? p2 : '?';
             lines.push(
-              `  ${m.date ?? '?'} ${m.tournament ?? '?'}${m.round ? ` (${m.round})` : ''} — ` +
+              `  ${m.date ?? '?'} ${m.tournament ?? '?'}${m.round ? ` (${m.round})` : ''}: ` +
                 `${who} won${m.score ? ` ${m.score}` : ''}${m.era === 'archive' ? ' · archive' : ''}` +
                 `${m.outcome && m.outcome !== 'completed' ? ` · ${m.outcome}` : ''}`,
             );
@@ -1470,12 +1880,12 @@ export const defineGetH2H = (ctx: Context) =>
 export const defineGetMatchEvents = (ctx: Context) =>
   tool({
     description:
-      'Timeline of events for a match — breaks, games won, sets won, momentum runs. ' +
-      'Requires the PRO plan.',
+      'Timeline of events for a match: breaks, games won, sets won, momentum runs. Requires the PRO ' +
+      'plan.',
     inputSchema: z.object({ match_id: matchIdField, limit: limitField(200, 30, 'events') }),
     outputSchema: MatchEventsOutput,
     execute: ({ match_id, limit }): Promise<z.infer<typeof MatchEventsOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(MatchEventsOutput, async () => {
         const page = await ctx.client.listMatchEvents(match_id, { limit });
         if (!page.data.length) {
           return { ok: true as const, message: 'No events recorded for this match.', events: [] };
@@ -1483,7 +1893,7 @@ export const defineGetMatchEvents = (ctx: Context) =>
         return {
           ok: true as const,
           message: page.data
-            .map((e) => `${e.timestamp ?? '?'} — ${e.type ?? '?'}${e.player ? ` (player ${e.player})` : ''}`)
+            .map((e) => `${e.timestamp ?? '?'} · ${e.type ?? '?'}${e.player ? ` (player ${e.player})` : ''}`)
             .join('\n'),
           events: page.data.map((e) => ({ timestamp: n(e.timestamp), type: n(e.type), player: n(e.player) })),
         };
@@ -1493,13 +1903,13 @@ export const defineGetMatchEvents = (ctx: Context) =>
 export const defineGetMatchOdds = (ctx: Context) =>
   tool({
     description:
-      'Match-winner market prices for a match — implied probability per player, with ' +
-      'bid, ask and mid. Requires the PRO plan. Match rows carry has_market — check it first; ' +
-      'a match with no market mapped has no prices to return.',
+      'Match-winner market prices for a match: implied probability per player, with bid, ask and ' +
+      'mid. Requires the PRO plan. Match rows carry has_market, so check it first. A match with no ' +
+      'market mapped has no prices to return.',
     inputSchema: z.object({ match_id: matchIdField, limit: limitField(200, 10, 'price points') }),
     outputSchema: MatchOddsOutput,
     execute: ({ match_id, limit }): Promise<z.infer<typeof MatchOddsOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(MatchOddsOutput, async () => {
         const market = await ctx.client.getMarketPrices(match_id, { limit });
         if (!market) return { ok: true as const, message: 'No market data for that match.' };
         const lines = [`Market: ${market.question ?? '-'}`];
@@ -1536,29 +1946,30 @@ export const defineGetMatchOdds = (ctx: Context) =>
 export const defineGetRankings = (ctx: Context) =>
   tool({
     description:
-      'The FULL published ranking table in rank order for one system — the newest week at or before ' +
-      'as_of. Rows carry player_name as published and a null player_id for players outside our roster, ' +
-      'so the table has no silent holes. ATP/WTA history runs deep; the ITF circuits begin 2026-07-29. ' +
-      'For point-in-time records of SPECIFIC players use get_player_rankings. Requires the PRO plan.',
+      'The FULL published ranking table in rank order for one system, from the newest week at or ' +
+      'before as_of. Rows carry player_name as published and a null player_id for players outside ' +
+      'our roster, so the table has no silent holes. ATP/WTA history runs deep. The ITF circuits ' +
+      'begin 2026-07-29. For point-in-time records of SPECIFIC players use get_player_rankings. ' +
+      'Requires the PRO plan.',
     inputSchema: z.object({
       system: z
         .enum(['atp', 'wta', 'itf_jt', 'itf_mt', 'itf_wt'])
-        .describe('Ranking system to list. utr has no listing — it is a rating, not a ranking.'),
+        .describe('Ranking system to list. utr has no listing, because it is a rating, not a ranking.'),
       as_of: z
         .string()
         .optional()
-        .describe('YYYY-MM-DD — serves the newest published week at or before this date. Omit for latest.'),
+        .describe('YYYY-MM-DD. Serves the newest published week at or before this date. Omit for latest.'),
       limit: limitField(200, 20, 'ranking rows'),
     }),
     outputSchema: RankingsOutput,
     execute: ({ system, as_of, limit }): Promise<z.infer<typeof RankingsOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(RankingsOutput, async () => {
         const res = await ctx.client.listRankings({ system, as_of, limit });
         const rows = res.data ?? [];
         if (!rows.length) {
           return {
             ok: true as const,
-            message: `No ${system} ranking table for that date — ITF history begins 2026-07-29 and cannot be reconstructed earlier.`,
+            message: `No ${system} ranking table for that date. ITF history begins 2026-07-29 and cannot be reconstructed earlier.`,
             rankings: [],
           };
         }
@@ -1566,9 +1977,125 @@ export const defineGetRankings = (ctx: Context) =>
         return {
           ok: true as const,
           message:
-            `${system} rankings${week ? ` — week of ${week}` : ''}${as_of ? ` (as of ${as_of})` : ''}:\n` +
+            `${system} rankings${week ? `, week of ${week}` : ''}${as_of ? ` (as of ${as_of})` : ''}:\n` +
             rows.map(rankingLine).join('\n'),
           rankings: rows.map(rankingRowOut),
+        };
+      }),
+  });
+
+export const definePlayerStats = (ctx: Context) =>
+  tool({
+    // Word for word the description of livetennisapi-mcp's player_stats.
+    description:
+      "One player's record over our own completed singles matches (2023 onward), by default the last " +
+      '365 days. It gives W/L overall, over the last 12 months and by surface, venue, level and season. ' +
+      'It also gives tiebreaks, deciding sets, the record after winning or losing the first set, ' +
+      'comebacks, withdrawals and the last N matches. Every count carries its sample size, and a ' +
+      'percentage on an empty sample is null, never 0. On ULTRA it adds serve_return: measured serve ' +
+      'and return statistics summed over the window. Singles only, so a doubles-team id is refused. ' +
+      'For 1968 to 2022 use get_archive_career. Requires the PRO plan (serve_return requires ULTRA).',
+    inputSchema: z.object({
+      player_id: z.number().int().describe('Player id, as returned by search_players.'),
+      from: z
+        .string()
+        .optional()
+        .describe('Window start: YYYY-MM-DD (start of that day) or a UTC ISO-8601 instant. Default to minus 365 days.'),
+      to: z
+        .string()
+        .optional()
+        .describe('Window end: YYYY-MM-DD (the whole of that day) or a UTC ISO-8601 instant. Default now.'),
+      surface: z
+        .enum(['hard', 'clay', 'grass', 'indoor'])
+        .optional()
+        .describe('hard, clay or grass read the match surface; indoor keeps matches stated indoor, on any surface.'),
+      level: z
+        .enum(['atp', 'wta', 'challenger', 'itf', 'juniors'])
+        .optional()
+        .describe('The match tour. A match with no stated tour matches no level.'),
+      last: z
+        .number()
+        .int()
+        .min(1)
+        .max(50)
+        .optional()
+        .describe('How many recent matches to list, newest first (1-50, default 20).'),
+    }),
+    outputSchema: PlayerStatsOutput,
+    execute: ({ player_id, from, to, surface, level, last }): Promise<z.infer<typeof PlayerStatsOutput>> =>
+      ctx.guard(PlayerStatsOutput, async () => {
+        const body = await ctx.client.getPlayerStats(player_id, { from, to, surface, level, last });
+        // Every block is read by type: the server shapes these objects freely,
+        // and one stray value would fail the schema the result is parsed against.
+        const r = plainObject(body?.records);
+        if (!r) return { ok: true as const, message: 'No record returned for that player id.' };
+        const player = { id: num(body.player?.id), name: str(body.player?.name) };
+        const window = { from: str(body.window?.from), to: str(body.window?.to) };
+        const overall = winLossOut(r.overall);
+        const last12 = winLossOut(r.last_12_months);
+        const bySurface = winLossRecord(r.by_surface);
+        const recent = (Array.isArray(r.recent) ? r.recent : []).map((item: unknown) => {
+          const m = plainObject(item) ?? {};
+          const opponent = plainObject(m.opponent);
+          return {
+            match_id: num(m.match_id),
+            date: str(m.date),
+            tournament: str(m.tournament),
+            round: str(m.round),
+            surface: str(m.surface),
+            opponent: str(opponent?.name),
+            opponent_id: num(opponent?.id),
+            won: bool(m.won),
+            outcome: str(m.outcome),
+            score: sideScore(m.score),
+          };
+        });
+        const lines = [
+          `${player.name ?? 'Player'} [${player.id ?? player_id}], ${window.from ?? '?'} → ${window.to ?? '?'}`,
+          `Overall: ${winLossLine(overall)} · last 12 months: ${winLossLine(last12)}`,
+        ];
+        if (bySurface && Object.keys(bySurface).length) {
+          lines.push(
+            `By surface: ${Object.entries(bySurface)
+              .map(([s, wl]) => `${s} ${winLossLine(wl)}`)
+              .join(' · ')}`,
+          );
+        }
+        if (recent.length) {
+          lines.push(
+            `Recent (${recent.length}):`,
+            ...recent.map(
+              (m) =>
+                `  ${m.date ?? '?'} ${m.won === true ? 'W' : m.won === false ? 'L' : '?'} vs ${m.opponent ?? '?'}` +
+                `${m.score ? ` ${m.score}` : ''}${m.outcome && m.outcome !== 'completed' ? ` (${m.outcome})` : ''}` +
+                `${m.tournament ? `, ${m.tournament}` : ''}`,
+            ),
+          );
+        }
+        // serve_return is absent below ULTRA. It is passed through as the
+        // server sent it, like the MCP server does.
+        const serveReturn = plainObject(body.serve_return);
+        if (serveReturn) {
+          lines.push(
+            `Serve/return: summed over ${num(serveReturn.matches_with_stats) ?? 0} of ` +
+              `${num(serveReturn.matches) ?? 0} matches with statistics.`,
+          );
+        }
+        return {
+          ok: true as const,
+          message: lines.join('\n'),
+          player,
+          window,
+          overall,
+          last_12_months: last12,
+          by_surface: bySurface,
+          by_venue: winLossRecord(r.by_venue),
+          by_level: winLossRecord(r.by_level),
+          by_season: winLossRecord(r.by_season),
+          sets: plainObject(r.sets),
+          withdrawals: plainObject(r.withdrawals),
+          recent,
+          serve_return: serveReturn,
         };
       }),
   });
@@ -1578,13 +2105,13 @@ export const defineGetRankings = (ctx: Context) =>
 export const defineGetMatchAnalysis = (ctx: Context) =>
   tool({
     description:
-      "Model analysis for a match: predicted win probability, the model's thesis and " +
-      'the key factors behind it. Requires the ULTRA plan. Match rows carry has_analysis — check it ' +
-      'first; a match with no thesis or profile has nothing to return.',
+      'Model analysis for a match: predicted win probability, the model\'s thesis and the main ' +
+      'factors behind it. Requires the ULTRA plan. Match rows carry has_analysis, so check it ' +
+      'first. A match with no thesis or profile has nothing to return.',
     inputSchema: z.object({ match_id: matchIdField }),
     outputSchema: MatchAnalysisOutput,
     execute: ({ match_id }): Promise<z.infer<typeof MatchAnalysisOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(MatchAnalysisOutput, async () => {
         const analysis = await ctx.client.getMatchAnalysis(match_id);
         if (!analysis || (!analysis.thesis && !analysis.profile)) {
           return { ok: true as const, message: 'No model analysis exists for this match yet.' };
@@ -1599,7 +2126,7 @@ export const defineGetMatchAnalysis = (ctx: Context) =>
           }
           if (p.expected_closeness != null) lines.push(`  Expected closeness: ${p.expected_closeness}`);
           if (p.volatility_rating) lines.push(`  Volatility: ${p.volatility_rating}`);
-          if (p.key_factors?.length) lines.push(`  Key factors: ${p.key_factors.join('; ')}`);
+          if (p.key_factors?.length) lines.push(`  Main factors: ${p.key_factors.join(' · ')}`);
           out.profile = {
             win_probability_p1: n(p.win_probability_p1),
             expected_closeness: n(p.expected_closeness),
@@ -1629,11 +2156,11 @@ export const defineGetMatchAnalysis = (ctx: Context) =>
 export const defineGetPlayerRankings = (ctx: Context) =>
   tool({
     description:
-      'Point-in-time ranking records for SPECIFIC players: per system, the newest record in force ON OR ' +
-      'BEFORE as_of — never one dated after it. Every other ranking field in this API is the CURRENT ' +
-      'value joined at read time; this is the historical answer. Systems are never collapsed: ATP/WTA and ' +
-      'the ITF circuits carry rank+points, UTR a rating. ITF and UTR history begins 2026-07-29. ' +
-      'Requires the ULTRA plan.',
+      'Point-in-time ranking records for SPECIFIC players. Per system, the newest record in force ' +
+      'ON OR BEFORE as_of, never one dated after it. Every other ranking field in this API is the ' +
+      'CURRENT value joined at read time. This one is the historical answer. Systems are never ' +
+      'collapsed: ATP/WTA and the ITF circuits carry rank+points, UTR a rating. ITF and UTR history ' +
+      'begins 2026-07-29. Requires the ULTRA plan.',
     inputSchema: z.object({
       player_ids: z
         .array(z.number().int())
@@ -1643,7 +2170,7 @@ export const defineGetPlayerRankings = (ctx: Context) =>
       as_of: z
         .string()
         .optional()
-        .describe('YYYY-MM-DD — the record in force on this date. Omit for the latest known.'),
+        .describe('YYYY-MM-DD. The record in force on this date. Omit for the latest known.'),
       system: z
         .enum(['atp', 'wta', 'itf_jt', 'itf_mt', 'itf_wt', 'utr'])
         .optional()
@@ -1651,7 +2178,7 @@ export const defineGetPlayerRankings = (ctx: Context) =>
     }),
     outputSchema: PlayerRankingsOutput,
     execute: ({ player_ids, as_of, system }): Promise<z.infer<typeof PlayerRankingsOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(PlayerRankingsOutput, async () => {
         const res = await ctx.client.listRankings({ player: player_ids, as_of, system });
         const rows = res.data ?? [];
         const coverage = res.meta?.coverage ?? null;
@@ -1660,7 +2187,7 @@ export const defineGetPlayerRankings = (ctx: Context) =>
             ok: true as const,
             message:
               'No ranking records in force for those players at that date. ITF and UTR history begins ' +
-              '2026-07-29 and cannot be reconstructed earlier — check the coverage field.',
+              '2026-07-29 and cannot be reconstructed earlier. Check the coverage field.',
             rankings: [],
             coverage,
           };
@@ -1684,22 +2211,22 @@ export const defineGetPlayerRankings = (ctx: Context) =>
 export const defineGetMatchStatistics = (ctx: Context) =>
   tool({
     description:
-      'In-play (or final) statistics for one match, in TWO families kept deliberately separate: DERIVED ' +
-      'is rebuilt from the point-by-point record (holds/breaks, break points, service/return points); ' +
-      'MEASURED is counted upstream and includes what no point record can yield — aces, double faults, ' +
-      'the serve split, winners/unforced errors. Measured coverage varies by tour; absent fields are ' +
-      'omitted, never zero-filled. Requires the ULTRA plan.',
+      'In-play (or final) statistics for one match, in TWO families kept separate on purpose. ' +
+      'DERIVED is rebuilt from the point-by-point record (holds/breaks, break points, ' +
+      'service/return points). MEASURED is counted upstream. It includes what no point record can ' +
+      'yield: aces, double faults, the serve split, winners/unforced errors. Measured coverage ' +
+      'varies by tour. Absent fields are omitted, never zero-filled. Requires the ULTRA plan.',
     inputSchema: z.object({ match_id: matchIdField }),
     outputSchema: MatchStatisticsOutput,
     execute: ({ match_id }): Promise<z.infer<typeof MatchStatisticsOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(MatchStatisticsOutput, async () => {
         const res = await ctx.client.getMatchStatistics(match_id);
         const shape = (side: MatchStatisticsSide | null | undefined): z.infer<typeof StatsSideOut> | null => {
           if (!side) return null;
           const { measured, ...derived } = side;
           return {
-            derived: derived as Record<string, number | null>,
-            measured: (measured as Record<string, number | null> | undefined) ?? null,
+            derived: numRecord(derived) ?? {},
+            measured: numRecord(measured),
           };
         };
         const players = res.players;
@@ -1712,7 +2239,7 @@ export const defineGetMatchStatistics = (ctx: Context) =>
             ok: true as const,
             message:
               `No statistics held for match ${match_id} (coverage: ${coverage ?? 'none'}). ` +
-              'The match exists — holding nothing for it is the honest answer, not an error.',
+              'The match exists. Holding nothing for it is the honest answer, not an error.',
             statistics: { coverage, as_of: n(res.as_of), games_counted: null, players: null, freshness },
           };
         }
@@ -1742,14 +2269,14 @@ export const defineGetMatchStatistics = (ctx: Context) =>
           return `  ${label}: ${parts.join(' · ') || 'no data'}`;
         };
         const bits = [
-          `Match ${match_id} statistics — coverage ${coverage ?? '?'}` +
+          `Match ${match_id} statistics, coverage ${coverage ?? '?'}` +
             `${res.games_counted != null ? `, ${res.games_counted} games counted (tiebreaks excluded)` : ''}`,
           line('Player 1', p1),
           line('Player 2', p2),
         ];
         if (coverage === 'diverged') {
           bits.push(
-            '  Measured values are withheld: the two families disagree about this match — see freshness.measured_divergence.',
+            '  Measured values are withheld: the two families disagree about this match. See freshness.measured_divergence.',
           );
         }
         return {
@@ -1769,18 +2296,19 @@ export const defineGetMatchStatistics = (ctx: Context) =>
 export const defineGetChartingPlayer = (ctx: Context) =>
   tool({
     description:
-      'Career shot-level profile from the Match Charting Project: serve placement (deuce/ad × wide/body/T), ' +
-      'return depth and outcomes, net play, clutch break/game/set-point serving, winners and errors by ' +
-      'wing, rally-length tendencies — summed over the player\'s charted matches. COVERAGE IS CURATED ' +
-      '(11,646 charted matches back to the 1960s, concentrated on the majors), not full-slate. An ' +
-      'ambiguous name returns the candidates to choose from. Requires the ULTRA plan.',
+      'Career shot-level profile from the Match Charting Project, summed over the player\'s charted ' +
+      'matches. Serve placement (deuce/ad x wide/body/T), return depth and outcomes, net play, and ' +
+      'clutch break/game/set-point serving. Also winners and errors by wing, and rally-length ' +
+      'tendencies. COVERAGE IS CURATED, not full-slate: 11,646 charted matches back to the 1960s, ' +
+      'concentrated on the majors. An ambiguous name returns the candidates to choose from. ' +
+      'Requires the ULTRA plan.',
     inputSchema: z.object({
-      name: z.string().min(3).describe('Player name fragment, min 3 chars — must resolve to one charted person.'),
+      name: z.string().min(3).describe('Player name fragment, min 3 chars. Must resolve to one charted person.'),
       gender: z.enum(['men', 'women']).optional().describe('Disambiguates a name charted on both tours.'),
     }),
     outputSchema: ChartingPlayerOutput,
     execute: ({ name, gender }): Promise<z.infer<typeof ChartingPlayerOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(ChartingPlayerOutput, async () => {
         const res = await ctx.client.getChartingPlayer(name, { gender });
         const player = (res.player as Record<string, unknown> | undefined) ?? null;
         const families = res.families ?? {};
@@ -1788,7 +2316,7 @@ export const defineGetChartingPlayer = (ctx: Context) =>
         return {
           ok: true as const,
           message:
-            `${who} — ${res.matches_charted ?? '?'} charted match(es), summed from the Match Charting Project ` +
+            `${who}: ${res.matches_charted ?? '?'} charted match(es), summed from the Match Charting Project ` +
             `(curated coverage, not full-slate).\nStat families: ${Object.keys(families).join(', ') || 'none'}. ` +
             'The full sums are in the structured output.',
           player,
@@ -1802,15 +2330,16 @@ export const defineGetChartingPlayer = (ctx: Context) =>
 export const defineGetChartingMatch = (ctx: Context) =>
   tool({
     description:
-      'Every Match Charting Project stat family for ONE charted match, both players, with the per-set ' +
-      'split (set 1, set 2, …, Total) exactly as charted. Charting ids are their own id space ' +
-      '(1960–2026), mostly matches with no counterpart in the live tables. Requires the ULTRA plan.',
+      'Every Match Charting Project stat family for ONE charted match, both players, with the ' +
+      'per-set split (set 1, set 2, ..., Total) exactly as charted. Charting ids are their own id ' +
+      'space (1960 to 2026). Most of these matches have no counterpart in the live tables. Requires ' +
+      'the ULTRA plan.',
     inputSchema: z.object({
-      charting_match_id: z.number().int().describe('Charting match id — its own id space, not a match_id.'),
+      charting_match_id: z.number().int().describe('Charting match id, in its own id space. Not a match_id.'),
     }),
     outputSchema: ChartingMatchOutput,
     execute: ({ charting_match_id }): Promise<z.infer<typeof ChartingMatchOutput>> =>
-      ctx.guard(async () => {
+      ctx.guard(ChartingMatchOutput, async () => {
         const res = await ctx.client.getChartingMatch(charting_match_id);
         const players = (res.players as Record<string, unknown> | undefined) ?? null;
         const families = (res.families as Record<string, unknown> | undefined) ?? {};
@@ -1835,11 +2364,55 @@ export const defineGetChartingMatch = (ctx: Context) =>
 
 // -- meta --
 
+type Usage = { tier: string; base: string | null; expires: string | null };
+
+/**
+ * GET /usage for the configured key: the plan, read rather than inferred.
+ * 'rejected' on a 401. A RateLimited error on a 429, so the caller reports it
+ * and stops: probing on through a rate limit or an abuse block is the one thing
+ * that must not happen. null for anything else (an older server without the
+ * endpoint, a 5xx, a network error, an unexpected body), so the caller falls
+ * back to probing. Never throws.
+ */
+async function readUsage(ctx: Context): Promise<Usage | 'rejected' | RateLimited | null> {
+  const plan = (v: unknown) => {
+    const t = typeof v === 'string' ? v.toUpperCase() : '';
+    return ['FREE', 'BASIC', 'PRO', 'ULTRA'].includes(t) ? t : null;
+  };
+  try {
+    const res = await fetch(`${ctx.client.baseUrl}/usage`, {
+      headers: { Authorization: `Bearer ${ctx.apiKey}`, Accept: 'application/json' },
+      signal: AbortSignal.timeout(ctx.client.timeout),
+    });
+    if (res.status === 401) return 'rejected';
+    if (res.status === 429) {
+      const body: unknown = await res.json().catch(() => undefined);
+      const after = Number(res.headers.get('retry-after'));
+      return new RateLimited('rate_limited', {
+        status: 429,
+        body,
+        retryAfter: Number.isFinite(after) && after >= 0 ? after : undefined,
+      });
+    }
+    if (!res.ok) {
+      await res.body?.cancel().catch(() => undefined);
+      return null;
+    }
+    const body: unknown = await res.json().catch(() => null);
+    if (!body || typeof body !== 'object') return null;
+    const b = body as { tier?: unknown; base_tier?: unknown; tier_expires_at?: unknown };
+    const tier = plan(b.tier);
+    return tier ? { tier, base: plan(b.base_tier), expires: scalar(b.tier_expires_at) } : null;
+  } catch {
+    return null;
+  }
+}
+
 export const defineCheckApiStatus = (ctx: Context) =>
   tool({
     description:
-      'Check whether the Live Tennis API is reachable and which plan the configured ' +
-      'key is on. Useful for diagnosing why other tools are refusing data.',
+      'Check whether the Live Tennis API is reachable and which plan the configured key is on. Use ' +
+      'it to find out why other tools are refusing data. Works with no key.',
     inputSchema: z.object({}),
     outputSchema: ApiStatusOutput,
     // Deliberately NOT wrapped in `guard`: diagnosing "why is everything else
@@ -1848,94 +2421,158 @@ export const defineCheckApiStatus = (ctx: Context) =>
     // message the user is trying to debug.
     execute: async (): Promise<z.infer<typeof ApiStatusOutput>> => {
       try {
-        const health = await ctx.client.health();
-        if (!ctx.apiKey) {
-          return {
-            ok: true,
-            message:
-              `API is reachable (status: ${health.status}, version: ${health.version}).\n` +
-              'No API key is configured, so only this check will work. Pass { apiKey } to the tool ' +
-              'factory or set LIVETENNISAPI_KEY — get a free key at https://livetennisapi.com/subscribe/free',
-            reachable: true,
-            api_version: n(health.version),
-            tier: null,
-            has_key: false,
-          };
-        }
-        // Probe upward to discover the tier without asking the user.
-        let tier = 'BASIC';
-        try {
-          await ctx.client.listMatches({ status: 'completed', limit: 1 });
-        } catch (err) {
-          if (err instanceof Unauthorized) {
-            return {
-              ok: true,
-              message: 'API is reachable, but the configured key was rejected (unauthorized).',
-              reachable: true,
-              api_version: n(health.version),
-              tier: null,
-              has_key: true,
-            };
-          }
-          throw err;
-        }
-        // FREE stops short of history, so an UpgradeRequired HERE identifies it —
-        // and MUST be caught. Uncaught it escapes to the outer handler, which
-        // would report a perfectly valid free key as "Could not reach the API".
-        let historyPage: Awaited<ReturnType<typeof ctx.client.listCompletedMatches>> | null = null;
-        try {
-          historyPage = await ctx.client.listCompletedMatches({ limit: 1 });
-        } catch (err) {
-          if (err instanceof UpgradeRequired) tier = 'FREE';
-          else throw err;
-        }
-        const id = historyPage?.data[0]?.id;
-        // A FREE key cannot hold PRO/ULTRA, so skip the climb entirely.
-        if (tier !== 'FREE' && id != null) {
-          // Climb the ladder. Only UpgradeRequired proves a tier is NOT held --
-          // NotFound means the call was allowed but that match has no data, so
-          // it is evidence of entitlement, not of a missing plan.
-          try {
-            await ctx.client.listMatchEvents(id, { limit: 1 });
-            tier = 'PRO';
-          } catch (err) {
-            if (err instanceof NotFound) tier = 'PRO';
-            else if (!(err instanceof UpgradeRequired)) throw err;
-          }
-          if (tier === 'PRO') {
-            try {
-              await ctx.client.getMatchAnalysis(id);
-              tier = 'ULTRA';
-            } catch (err) {
-              if (err instanceof NotFound) tier = 'ULTRA';
-              else if (!(err instanceof UpgradeRequired)) throw err;
-            }
-          }
-        }
-        return {
-          ok: true,
-          message:
-            `API is reachable (status: ${health.status}, version: ${health.version}).\n` +
-            `The configured key appears to be on the ${tier} plan.\n\n` +
-            'FREE  = live & upcoming matches, scores, players, fixtures, tournaments\n' +
-            'BASIC = + historical results, the results archive (1968–2022), head-to-head\n' +
-            'PRO   = + match events, market prices, rankings listing\n' +
-            'ULTRA = + model analysis, win probability, as-of rankings, match statistics, charting, live feed',
-          reachable: true,
-          api_version: n(health.version),
-          tier,
-          has_key: true,
-        };
+        return ctx.scrub(await checkStatus(ctx));
       } catch (err) {
-        // The MCP server returns `isError: true` here. This package has no such
-        // channel, and an unreachable API is exactly the finding this tool
-        // exists to report — so it is reported as data, not as a throw.
-        return {
-          ok: false,
-          message: `Could not reach the API: ${err instanceof Error ? err.message : String(err)}`,
-          reachable: false,
-          has_key: Boolean(ctx.apiKey),
-        };
+        // checkStatus handles every failure it knows of. This is the backstop
+        // that keeps the "execute never throws" promise if it ever misses one.
+        return ctx.scrub({ ok: false, message: ctx.describeFailure(err), has_key: Boolean(ctx.apiKey) });
       }
     },
   });
+
+/** check_api_status itself. Its result passes through ctx.scrub on the way out. */
+async function checkStatus(ctx: Context): Promise<z.infer<typeof ApiStatusOutput>> {
+  const scrub = (text: string) => redact(text, ctx.apiKey);
+  let health: { status?: unknown; version?: unknown } | null = null;
+  try {
+    const raw: unknown = await ctx.client.health();
+    if (raw && typeof raw === 'object') health = raw as { status?: unknown; version?: unknown };
+  } catch (err) {
+    // A 429 on the health check means the API is up and refusing this client.
+    // It gets the same message every tool gives, with its do-not-retry advice.
+    if (err instanceof RateLimited) {
+      return {
+        ok: false,
+        message: `The API answered the health check with a rate limit. ${ctx.describeFailure(err)}`,
+        reachable: true,
+        has_key: Boolean(ctx.apiKey),
+      };
+    }
+    // The MCP server returns `isError: true` here. This package has no such
+    // channel, and an unreachable API is exactly the finding this tool
+    // exists to report. So it is reported as data, not as a throw.
+    return {
+      ok: false,
+      message: `Could not reach the API: ${scrub(err instanceof Error ? err.message : String(err))}`,
+      reachable: false,
+      has_key: Boolean(ctx.apiKey),
+    };
+  }
+  if (!health) {
+    // A 200 that is not JSON: a proxy page, or a baseUrl pointing somewhere else.
+    return {
+      ok: false,
+      message:
+        `Could not reach the API: the health check at ${scrub(ctx.client.baseUrl)}/health did not answer ` +
+        'with JSON. Check the baseUrl option or LIVETENNISAPI_BASE_URL.',
+      reachable: false,
+      has_key: Boolean(ctx.apiKey),
+    };
+  }
+  const version = scalar(health.version);
+  const up = `API is reachable (status: ${scalar(health.status) ?? '?'}, version: ${version ?? '?'}).`;
+  const base = { reachable: true, api_version: version, has_key: Boolean(ctx.apiKey) };
+  if (ctx.keyProblem) return { ok: true, message: `${up}\n${ctx.keyProblem}`, ...base, tier: null };
+  if (!ctx.apiKey) {
+    return {
+      ok: true,
+      message:
+        `${up}\nNo API key is configured, so only this check will work. Pass { apiKey } to the tool ` +
+        'factory or set LIVETENNISAPI_KEY. Get a free key at https://livetennisapi.com/subscribe/free',
+      ...base,
+      tier: null,
+    };
+  }
+  const rejected = {
+    ok: true,
+    message: `${up}\nThe configured API key was rejected (unauthorized). Keys are at https://livetennisapi.com`,
+    ...base,
+    tier: null,
+  };
+  const plans =
+    '\n\nFREE  = live & upcoming matches, scores, players, fixtures, tournaments\n' +
+    'BASIC = + historical results, the results archive (1968 to 2022), head-to-head\n' +
+    'PRO   = + match events, market prices, rankings listing, player records\n' +
+    'ULTRA = + model analysis, win probability, as-of rankings, match statistics, charting, live feed';
+
+  // GET /usage names the plan outright and does not count against the quota.
+  // The livetennisapi client has no method for it, so it is one plain fetch
+  // with the same Bearer header the client sends.
+  const usage = await readUsage(ctx);
+  if (usage === 'rejected') return rejected;
+  if (usage instanceof RateLimited) {
+    return ctx.scrub({ ok: false, message: `${up} The plan check failed. ${ctx.describeFailure(usage)}`, ...base, tier: null });
+  }
+  if (usage) {
+    const grant =
+      usage.base && usage.base !== usage.tier
+        ? ` That is a temporary grant over the ${usage.base} subscription${usage.expires ? `, until ${usage.expires}` : ''}.`
+        : '';
+    return {
+      ok: true,
+      message: `${up}\nThe configured API key is on the ${usage.tier} plan.${grant}${plans}`,
+      ...base,
+      tier: usage.tier,
+    };
+  }
+
+  // No /usage answer (an older or self-hosted server, or a rate limit), so
+  // probe upward. Only UpgradeRequired proves a plan is NOT held.
+  try {
+    let tier = 'BASIC';
+    let historyPage: Awaited<ReturnType<typeof ctx.client.listCompletedMatches>> | null = null;
+    try {
+      historyPage = await ctx.client.listCompletedMatches({ limit: 1 });
+    } catch (err) {
+      if (err instanceof Unauthorized) return rejected;
+      // FREE stops short of history, so a plan gate HERE identifies it. Any
+      // other 403 (a firewall page) is a failure to report, not a plan.
+      if (isPlanGate(err)) tier = 'FREE';
+      else throw err;
+    }
+    const id = historyPage?.data?.[0]?.id;
+    // A FREE key cannot hold PRO/ULTRA, so skip the climb entirely.
+    if (tier !== 'FREE' && id != null) {
+      // NotFound means the call was allowed but that match has no data, so
+      // it is evidence of entitlement, not of a missing plan.
+      try {
+        await ctx.client.listMatchEvents(id, { limit: 1 });
+        tier = 'PRO';
+      } catch (err) {
+        if (err instanceof NotFound) tier = 'PRO';
+        else if (!isPlanGate(err)) throw err;
+      }
+      if (tier === 'PRO') {
+        try {
+          await ctx.client.getMatchAnalysis(id);
+          tier = 'ULTRA';
+        } catch (err) {
+          if (err instanceof NotFound) tier = 'ULTRA';
+          else if (!isPlanGate(err)) throw err;
+        }
+      }
+    }
+    // A FREE key may spend 20 history calls a month, served exactly like an
+    // entitled call, so a history answer alone cannot tell BASIC from FREE.
+    const caveat =
+      tier === 'BASIC'
+        ? ' A FREE API key that still has free history calls this month looks the same to this check.'
+        : '';
+    return {
+      ok: true,
+      message: `${up}\nThe configured API key appears to be on the ${tier} plan.${caveat}${plans}`,
+      ...base,
+      tier,
+    };
+  } catch (err) {
+    // The health check answered, so the API is up: whatever failed was one
+    // of the plan probes (a rate limit, an abuse block, a 5xx). Say which,
+    // in the same words every other tool uses, rather than "unreachable".
+    return {
+      ok: false,
+      message: `${up} The plan check failed. ${ctx.describeFailure(err)}`,
+      ...base,
+      tier: null,
+    };
+  }
+}

@@ -34,7 +34,7 @@ const fail = (m) => { throw new Error(m); };
 delete process.env.LIVETENNISAPI_KEY;
 delete process.env.LIVETENNISAPI_BASE_URL;
 
-const { livetennisTools, getLiveMatches } = await import('../dist/index.js');
+const { livetennisTools, getLiveMatches, playerStats } = await import('../dist/index.js');
 
 /** Paths the upstream was asked for — printed on failure so a 404 is obvious. */
 const asked = [];
@@ -44,6 +44,7 @@ const MATCH = {
   tournament: 'Test Open',
   round: 'QF',
   status: 'live',
+  scheduled_time: '2026-08-19T08:00:00Z',
   surface: 'hard',
   indoor: false,
   winner: null,
@@ -136,6 +137,36 @@ const CHARTING_MATCH = {
   families: { overview: { sets: 5 } },
 };
 
+// GET /players/{id}/stats, trimmed from a real ULTRA answer (2026-10-22).
+const PLAYER_STATS = {
+  player: { id: 1, name: 'Player One' },
+  window: { from: '2025-10-22T00:00:00Z', to: '2026-10-22T00:00:00Z' },
+  filters: { surface: null, level: null, last: 2 },
+  records: {
+    overall: { matches: 58, wins: 56, losses: 2, win_pct: 96.6 },
+    last_12_months: { matches: 58, wins: 56, losses: 2, win_pct: 96.6 },
+    by_surface: { grass: { matches: 7, wins: 7, losses: 0, win_pct: 100 }, hard: { matches: 35, wins: 34, losses: 1, win_pct: 97.1 } },
+    by_venue: { indoor: { matches: 15, wins: 15, losses: 0, win_pct: 100 } },
+    by_level: { atp: { matches: 58, wins: 56, losses: 2, win_pct: 96.6 } },
+    by_season: { 2026: { matches: 43, wins: 41, losses: 2, win_pct: 95.3 } },
+    sets: { sample: { matches: 41 }, tiebreaks: { played: 18, won: 15, lost: 3, win_pct: 83.3 } },
+    withdrawals: { retired: { given: 0, received: 1 } },
+    excluded: { not_singles: 1, unresolved: 0, abandoned: 0, no_published_winner: 1 },
+    recent: [
+      {
+        match_id: 18913, date: '2026-07-12', tournament: 'Wimbledon', round: 'Final', surface: 'grass',
+        opponent: { id: 2, name: 'Player Two' }, won: true, outcome: 'completed',
+        score: { sets: [3, 1], games: [[6, 7, 6, 6], [7, 6, 3, 4]] },
+      },
+      { match_id: 18048, date: '2026-07-10', opponent: null, won: false, outcome: 'retired', score: null },
+    ],
+  },
+  serve_return: {
+    matches: 57, matches_with_stats: 2,
+    serve: { aces: { total: 31, matches: 2, per_match: 15.5 } },
+  },
+};
+
 const page = (row) => ({ data: [row], meta: { limit: 1, offset: 0, count: 1 } });
 
 /** Answer whatever the client asks for, shaped by what the path looks like. */
@@ -148,9 +179,11 @@ const upstream = createServer((req, res) => {
   };
   const path = url.split('?')[0];
   if (path.includes('/health')) return send({ status: 'ok', version: 'v1' });
+  if (path.endsWith('/usage')) return send({ tier: 'ultra', base_tier: 'ultra', tier_expires_at: null });
   // Most-specific paths first: several of these contain '/matches' or
   // '/players' as a substring and would otherwise be shadowed.
   if (path.includes('/statistics')) return send(STATISTICS);
+  if (/\/players\/\d+\/stats$/.test(path)) return send(PLAYER_STATS);
   if (path.includes('/charting/players')) return send(CHARTING_PLAYER);
   if (path.includes('/charting/matches')) return send(CHARTING_MATCH);
   if (path.includes('/history/archive/career')) return send(ARCHIVE_CAREER);
@@ -181,7 +214,7 @@ try {
 await new Promise((r) => upstream.listen(UPSTREAM_PORT, '127.0.0.1', r));
 
 /**
- * The 24 tools, and plausible arguments for each, so none is skipped for lack
+ * The 25 tools, and plausible arguments for each, so none is skipped for lack
  * of input. `payload` is the field that proves the stub's data actually made it
  * through the mapper rather than the tool merely returning `ok: true`.
  */
@@ -204,6 +237,7 @@ const EXPECTED = {
   get_match_events: { args: { match_id: 101, limit: 2 }, payload: 'events' },
   get_match_odds: { args: { match_id: 101, limit: 2 }, payload: 'market' },
   get_rankings: { args: { system: 'atp', limit: 2 }, payload: 'rankings' },
+  player_stats: { args: { player_id: 1, last: 2 }, payload: 'overall' },
   get_match_analysis: { args: { match_id: 101 }, payload: 'profile' },
   get_player_rankings: { args: { player_ids: [1] }, payload: 'rankings' },
   get_match_statistics: { args: { match_id: 101 }, payload: 'statistics' },
@@ -220,9 +254,9 @@ async function main() {
   const names = Object.keys(tools);
 
   // 1. Parity with the MCP server. A tool that exists on one surface and not
-  //    the other is a bug in whichever one was edited last, and 24 is the number
+  //    the other is a bug in whichever one was edited last, and 25 is the number
   //    both READMEs, both registries and the MCP test all quote.
-  if (names.length !== 24) fail(`expected 24 tools, got ${names.length}: ${names.join(', ')}`);
+  if (names.length !== 25) fail(`expected 25 tools, got ${names.length}: ${names.join(', ')}`);
   const missing = Object.keys(EXPECTED).filter((k) => !names.includes(k));
   const extra = names.filter((k) => !EXPECTED[k]);
   if (missing.length || extra.length) {
@@ -231,7 +265,7 @@ async function main() {
 
   // Parity with the MCP server — the real invariant, not just tool names.
   //
-  // These are two copies of the same 24 tools. A description improved in one and
+  // These are two copies of the same 25 tools. A description improved in one and
   // not the other is the drift that actually costs users, and it is invisible to
   // a name-only check. So compare against what the MCP server ACTUALLY
   // advertises over the protocol, rather than regexing its source: source
@@ -240,7 +274,10 @@ async function main() {
   //
   // Optional by design — this package publishes standalone, so a missing or
   // unbuilt sibling must not fail the suite. But it says so out loud.
-  const mcpEntry = new URL('../../livetennisapi-mcp/dist/index.js', import.meta.url).pathname;
+  // LIVETENNISAPI_MCP_ENTRY points it at another build, such as a published
+  // livetennisapi-mcp installed into a scratch directory.
+  const mcpEntry =
+    process.env.LIVETENNISAPI_MCP_ENTRY || new URL('../../livetennisapi-mcp/dist/index.js', import.meta.url).pathname;
   if (existsSync(mcpEntry)) {
     const mcp = spawn('node', [mcpEntry], { stdio: ['pipe', 'pipe', 'ignore'] });
     const say = (o) => mcp.stdin.write(JSON.stringify(o) + '\n');
@@ -261,7 +298,7 @@ async function main() {
 
     const mcpTools = replies.get(2)?.result?.tools;
     if (!mcpTools) fail('could not read tools/list from the MCP server — parity check could not run');
-    if (mcpTools.length !== 24) fail(`MCP server advertises ${mcpTools.length} tools, expected 24`);
+    if (mcpTools.length !== 25) fail(`MCP server advertises ${mcpTools.length} tools, expected 25`);
 
     const drift = [];
     const mcpByName = new Map(mcpTools.map((t) => [t.name, t]));
@@ -271,14 +308,24 @@ async function main() {
       if (m.description !== t.description) {
         drift.push(`${name}: description differs from the MCP server`);
       }
+      // The same arguments, and the same ones required. Parameter wording is
+      // allowed to differ (this package's house style), parameter names are not.
+      const shape = t.inputSchema.shape ?? {};
+      const ours = Object.keys(shape).sort().join(',');
+      const theirs = Object.keys(m.inputSchema?.properties ?? {}).sort().join(',');
+      if (ours !== theirs) drift.push(`${name}: parameters [${ours}] here, [${theirs}] in the MCP server`);
+      const required = Object.keys(shape).filter((k) => !shape[k].isOptional()).sort().join(',');
+      const mcpRequired = [...(m.inputSchema?.required ?? [])].sort().join(',');
+      if (required !== mcpRequired) drift.push(`${name}: required [${required}] here, [${mcpRequired}] in the MCP server`);
     }
     for (const n of mcpByName.keys()) if (!tools[n]) drift.push(`only in MCP: ${n}`);
     if (drift.length) {
       fail(`DRIFTED from livetennisapi-mcp — the two packages must describe the same tools ` +
            `identically:\n    ` + drift.join('\n    '));
     }
-    console.log('  parity: 24 tools + descriptions identical to livetennisapi-mcp');
+    console.log(`  parity: 25 tools, descriptions and parameter names identical to livetennisapi-mcp (${mcpEntry})`);
   } else {
+    if (process.env.LIVETENNISAPI_MCP_ENTRY) fail(`LIVETENNISAPI_MCP_ENTRY does not exist: ${mcpEntry}`);
     console.log('  (livetennisapi-mcp not built alongside — PARITY CHECK SKIPPED)');
   }
 
@@ -357,6 +404,8 @@ async function main() {
   if (m.event_status_updated_at !== '2026-08-19T09:15:00Z') {
     fail(`event_status_updated_at not mapped: ${m.event_status_updated_at}`);
   }
+  if (m.scheduled_time !== '2026-08-19T08:00:00Z') fail(`scheduled_time not mapped: ${m.scheduled_time}`);
+  if (live.matches[1].scheduled_time !== null) fail('absent scheduled_time should map to null');
   if (!m.score || m.score === '') fail('score not formatted');
   if (!live.message.includes('Player One')) fail('message does not summarise the match');
   // has_analysis / has_market (added 2026-09-02): present-true and present-false
@@ -402,8 +451,29 @@ async function main() {
   if (p1stats.derived.hold_pct !== 85.7) fail(`derived stats not mapped: ${JSON.stringify(p1stats.derived)}`);
   if (p1stats.measured.aces !== 5) fail(`measured stats not mapped: ${JSON.stringify(p1stats.measured)}`);
 
+  const status = await tools.check_api_status.execute({}, EXEC_OPTS);
+  if (status.tier !== 'ULTRA') fail(`check_api_status did not read the plan from /usage: ${status.tier}`);
+
   const charted = await tools.get_charting_player.execute({ name: 'federer' }, EXEC_OPTS);
   if (charted.matches_charted !== 500) fail(`charting sample not mapped: ${JSON.stringify(charted)}`);
+
+  const ps = await tools.player_stats.execute({ player_id: 1, last: 2 }, EXEC_OPTS);
+  if (ps.overall?.wins !== 56 || ps.overall?.win_pct !== 96.6) fail(`player_stats overall not mapped: ${JSON.stringify(ps.overall)}`);
+  if (ps.by_surface?.grass?.matches !== 7) fail(`player_stats by_surface not mapped: ${JSON.stringify(ps.by_surface)}`);
+  if (ps.by_season?.['2026']?.wins !== 41) fail(`player_stats by_season not mapped: ${JSON.stringify(ps.by_season)}`);
+  if (ps.window?.from !== '2025-10-22T00:00:00Z') fail(`player_stats window not mapped: ${JSON.stringify(ps.window)}`);
+  const [r0, r1] = ps.recent ?? [];
+  if (r0?.score !== '6-7 7-6 6-3 6-4' || r0?.opponent !== 'Player Two' || r0?.opponent_id !== 2 || r0?.won !== true) {
+    fail(`player_stats recent match not mapped: ${JSON.stringify(r0)}`);
+  }
+  if (r1?.opponent !== null || r1?.score !== null || r1?.won !== false) {
+    fail(`player_stats recent match with no opponent or score should map to nulls: ${JSON.stringify(r1)}`);
+  }
+  if (ps.serve_return?.serve?.aces?.total !== 31) fail(`player_stats serve_return not passed through: ${JSON.stringify(ps.serve_return)}`);
+  if (ps.sets?.tiebreaks?.won !== 15) fail(`player_stats sets not passed through: ${JSON.stringify(ps.sets)}`);
+  if (!ps.message.includes('Overall: 56-2 (96.6%)') || !ps.message.includes('(retired)')) {
+    fail(`player_stats message does not summarise the record:\n${ps.message}`);
+  }
 
   // 6. The individual exports must behave identically to the set — they are the
   //    documented way to ship a subset, so they cannot be a second-class path.
@@ -413,8 +483,13 @@ async function main() {
     fail(`the individually-exported getLiveMatches disagrees with the set: ${JSON.stringify(soloResult).slice(0, 200)}`);
   }
 
+  const soloStats = await playerStats({ apiKey: 'twjp_test_key', baseUrl: BASE_URL }).execute({ player_id: 1 }, EXEC_OPTS);
+  if (soloStats.ok !== true || soloStats.overall?.wins !== 56) {
+    fail(`the individually-exported playerStats disagrees with the set: ${JSON.stringify(soloStats).slice(0, 200)}`);
+  }
+
   console.log(
-    'OK - 24 tools · description + described params + outputSchema · ' +
+    'OK - 25 tools · description + described params + outputSchema · ' +
       'output parsed by its own schema on the no-key AND success paths · ' +
       'mappers spot-checked · individual exports match the set',
   );

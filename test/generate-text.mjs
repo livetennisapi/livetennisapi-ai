@@ -11,7 +11,7 @@
  * provider rejects — fails only at that boundary. Calling `execute` by hand
  * would never notice.
  *
- * So this drives the whole loop against a MOCK model: assert all 24 tools reach
+ * So this drives the whole loop against a MOCK model: assert all 25 tools reach
  * the provider as well-formed JSON Schema, then have the mock call one and
  * confirm the result comes back through the SDK rather than through us.
  *
@@ -44,7 +44,13 @@ const upstream = createServer((req, res) => {
 });
 await new Promise((r) => upstream.listen(UPSTREAM_PORT, '127.0.0.1', r));
 
-const usage = { inputTokens: 10, outputTokens: 10, totalTokens: 20 };
+// The usage and finishReason shapes of the current LanguageModelV4 spec. The
+// older flat shapes (numbers, a bare string) stopped working in later ai@7
+// releases: the tool call was made but no tool result came back.
+const usage = {
+  inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+  outputTokens: { total: 10, text: 10, reasoning: 0 },
+};
 
 /** Step 1 calls the tool; step 2 answers using whatever came back. */
 let sentTools = null;
@@ -60,14 +66,14 @@ const model = new MockLanguageModelV4({
           toolName: 'get_live_matches',
           input: JSON.stringify({ limit: 2 }),
         }],
-        finishReason: 'tool-calls',
+        finishReason: { unified: 'tool-calls', raw: 'tool_calls' },
         usage,
         warnings: [],
       };
     }
     return {
       content: [{ type: 'text', text: 'Player One leads Player Two at the Test Open.' }],
-      finishReason: 'stop',
+      finishReason: { unified: 'stop', raw: 'stop' },
       usage,
       warnings: [],
     };
@@ -84,7 +90,7 @@ async function main() {
 
   // 1. Every tool reached the provider, converted to JSON Schema.
   if (!sentTools) fail('the model received no tools at all');
-  if (sentTools.length !== 24) fail(`the model received ${sentTools.length} tools, expected 24`);
+  if (sentTools.length !== 25) fail(`the model received ${sentTools.length} tools, expected 25`);
   for (const t of sentTools) {
     if (!t.name) fail(`a tool reached the provider with no name: ${JSON.stringify(t).slice(0, 120)}`);
     if (!t.description) fail(`${t.name} reached the provider with no description`);
@@ -116,7 +122,7 @@ async function main() {
   if (!result.text.includes('Player One')) fail(`unexpected final text: ${result.text}`);
 
   console.log(
-    'OK - generateText round trip · 24 tools converted to JSON Schema with descriptions intact · ' +
+    'OK - generateText round trip · 25 tools converted to JSON Schema with descriptions intact · ' +
       'tool executed by the SDK · structured result returned to the model',
   );
 }

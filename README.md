@@ -1,18 +1,22 @@
 # livetennisapi-ai
 
-**[Live Tennis API](https://livetennisapi.com) as [Vercel AI SDK](https://ai-sdk.dev) tools.** Give any
-AI SDK model real-time tennis scores, players, fixtures, tournaments, rankings, head-to-head, the
-1968–2022 results archive, market prices and model win-probability — ATP, WTA, Challenger, ITF and
-juniors.
+To give a [Vercel AI SDK](https://ai-sdk.dev) agent live tennis data, install `livetennisapi-ai`
+and pass `livetennisTools()` as the `tools` of `generateText` or `streamText`. The model then gets
+25 tools backed by [Live Tennis API](https://livetennisapi.com). They cover live scores, upcoming
+matches, players, fixtures, tournaments, rankings and head-to-head. They also reach player stats
+(win-loss splits by surface, venue, level and season), the 1968 to 2022 results archive, market
+prices and model win probability. Tours: ATP, WTA, Challenger, ITF and juniors. A free key (100
+requests a day, no card) runs the live tools.
 
-[![ci](https://github.com/livetennisapi/livetennisapi-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/livetennisapi/livetennisapi-ai/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/livetennisapi-ai.svg)](https://www.npmjs.com/package/livetennisapi-ai)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ```bash
-npm install livetennisapi-ai
+npm install livetennisapi-ai ai
 ```
 
-`ai` v7 is a peer dependency — this package uses whichever copy your app already has.
+`ai` v7 is a peer dependency, so the tools use the copy of the AI SDK your app already has. Like
+`ai` v7, the package needs Node 22 or later.
 
 ## Usage
 
@@ -30,28 +34,30 @@ const { text } = await generateText({
 console.log(text);
 ```
 
+The full guide is at https://docs.livetennisapi.com/ai-sdk.html.
+
 ### API key
 
-Resolved in this order:
+The key is read in this order:
 
-1. the explicit `apiKey` option — `livetennisTools({ apiKey: 'twjp_…' })`
+1. the `apiKey` option, as in `livetennisTools({ apiKey: 'twjp_...' })`
 2. `process.env.LIVETENNISAPI_KEY`
 
 Get a free key, no card, at **https://livetennisapi.com/subscribe/free**. The underlying client
-sends it as `Authorization: Bearer twjp_…`.
+sends it as `Authorization: Bearer twjp_...`.
 
-Prefer the explicit option when one process serves several users: each call to `livetennisTools()`
-returns a tool set bound to exactly one key, sharing no state with any other, so two users can hold
-two different plans in the same process.
+Pass the API key yourself when one process serves several users. Each call to `livetennisTools()`
+returns a tool set bound to one key and shares no state with any other set. Two users on two
+different plans can use the same process.
 
-With no key at all the tools still return normally — they answer with an explanation of how to get
-one, rather than throwing. See [Errors are values](#errors-are-values).
+With no API key the tools still answer. Each one returns `ok: false` and a message saying how to get
+a key. `check_api_status` is the one exception: it still checks the API and returns `ok: true`.
+See [Errors are values](#errors-are-values).
 
 ### Picking a subset
 
-Every tool is also exported individually. Worth doing: each tool's schema and description is sent to
-the model on **every** request, so an app that only needs live scores pays for the other twenty-one
-in tokens on every turn.
+Every tool is also exported on its own. Each tool's schema and description goes to the model on
+**every** request. An app that only needs live scores pays tokens for the other 23 on every turn.
 
 ```ts
 import { getLiveMatches, getMatchScore } from 'livetennisapi-ai';
@@ -62,14 +68,14 @@ const tools = {
 };
 ```
 
-## The 24 tools
+## The 25 tools
 
 | Tool | Individual export | Does | Plan |
 |---|---|---|---|
 | `get_live_matches` | `getLiveMatches` | Matches in progress, with live scores | FREE |
-| `get_upcoming_matches` | `getUpcomingMatches` | Matches due to start soon | FREE |
+| `get_upcoming_matches` | `getUpcomingMatches` | Matches due to start soon, with start times | FREE |
 | `get_match` | `getMatch` | Full detail for one match | FREE |
-| `get_match_score` | `getMatchScore` | Score only — lowest latency | FREE |
+| `get_match_score` | `getMatchScore` | The score only, lowest latency | FREE |
 | `search_players` | `searchPlayers` | Find players by name | FREE |
 | `get_player` | `getPlayer` | One player's profile and ranking | FREE |
 | `get_fixtures` | `getFixtures` | The forward schedule | FREE |
@@ -77,30 +83,30 @@ const tools = {
 | `get_tournament` | `getTournament` | One tournament by stable id | FREE |
 | `check_api_status` | `checkApiStatus` | Is the API up, and which plan is this key on | FREE |
 | `get_recent_results` | `getRecentResults` | Completed matches with winners, filterable | BASIC¹ |
-| `search_archive_matches` | `searchArchiveMatches` | Results archive 1968–2022 (1,485,752 matches) | BASIC¹ |
+| `search_archive_matches` | `searchArchiveMatches` | Results archive 1968 to 2022 (1,485,752 matches) | BASIC¹ |
 | `get_archive_match` | `getArchiveMatch` | One archive result, serve stats where recorded | BASIC¹ |
-| `search_archive_players` | `searchArchivePlayers` | Archive bios: hand, DOB, career-high rank | BASIC¹ |
-| `get_archive_career` | `getArchiveCareer` | Career W-L / titles / serve sums over the archive | BASIC¹ |
+| `search_archive_players` | `searchArchivePlayers` | Archive bios: hand, date of birth, career-high rank | BASIC¹ |
+| `get_archive_career` | `getArchiveCareer` | Career W-L, titles and serve sums over the archive | BASIC¹ |
 | `get_h2h` | `getH2H` | All-time head-to-head across both eras | BASIC¹ |
-| `get_match_events` | `getMatchEvents` | Match timeline — breaks, games, momentum | PRO |
+| `get_match_events` | `getMatchEvents` | Match timeline: breaks, games, momentum | PRO |
 | `get_match_odds` | `getMatchOdds` | Match-winner market: bid, ask, mid | PRO |
 | `get_rankings` | `getRankings` | The full published ranking table per system | PRO |
+| `player_stats` | `playerStats` | One player's W-L by surface, venue, level and season, set record, recent matches. Serve and return sums on ULTRA | PRO |
 | `get_match_analysis` | `getMatchAnalysis` | Model win probability and thesis | ULTRA |
 | `get_player_rankings` | `getPlayerRankings` | Point-in-time rankings for specific players | ULTRA |
-| `get_match_statistics` | `getMatchStatistics` | In-play stats: derived + measured families | ULTRA |
+| `get_match_statistics` | `getMatchStatistics` | In-play stats, derived and measured | ULTRA |
 | `get_charting_player` | `getChartingPlayer` | Career shot-level charting profile | ULTRA |
 | `get_charting_match` | `getChartingMatch` | Every charting stat family for one match | ULTRA |
 
-¹ or any History plan — History grants work even on a FREE core key.
+¹ Or any History plan. A History plan works even with a FREE core key.
 
-Plans: **FREE** = live & upcoming matches, scores, players, fixtures, tournaments · **BASIC** = +
-historical results, the results archive (1968–2022) and head-to-head · **PRO** = + match events,
-market prices and the rankings listing · **ULTRA** = + model analysis, win probability, per-player
-as-of rankings, in-play statistics, shot-level charting and the live WebSocket feed. Pricing at
-https://livetennisapi.com/#pricing
+FREE has live and upcoming matches, scores, players, fixtures and tournaments. BASIC adds
+historical results, the results archive (1968 to 2022) and head-to-head. PRO adds match events,
+market prices, the rankings listing and player records. ULTRA adds model analysis, win probability, per-player
+as-of rankings, in-play statistics, shot-level charting and the live WebSocket feed.
 
-`check_api_status` reports which plan your key is actually on, which is the fastest way to find out
-why another tool is declining to return data.
+Prices are at https://livetennisapi.com/#pricing. `check_api_status` tells you which plan your
+key is on. Start there when another tool declines to return data.
 
 ## Rate limits
 
@@ -111,77 +117,117 @@ why another tool is declining to return data.
 | PRO | 300 | 10,000 | $29.99/mo |
 | ULTRA | 600 | 500,000 | $99.99/mo |
 
-On a free key (100/day), poll no faster than every 15 minutes. An always-on dashboard should run on
+On a free key (100/day), poll no more often than every 15 minutes. An always-on dashboard needs
 BASIC or higher.
 
 ## Errors are values
 
-A tier wall, a rejected key, a missing key, a rate limit and an empty result **do not throw**. Each
-returns a normal result carrying `ok: false` and a `message` explaining the remedy:
+A tool's `execute` does not throw. Every result has `ok` and a `message` the model can pass to
+the user as it is.
+
+`ok: true` means the request worked, and that includes an empty answer. A list tool returns
+its list empty (`matches: []`, `players: []`) with a message such as "No matches are live right
+now." These answers are also `ok: true`:
+
+- `get_h2h` with `players: null` when no player matches the names.
+- `get_match_statistics` with `players: null` when the match has no statistics yet.
+- `player_stats` over a window with no matches. The W-L and set counts are 0. Every percentage
+  is `null`, never 0, and so are the `serve_return` sums.
+- A single-item tool with no data field, when the API answered with nothing.
+
+`ok: false` comes with a message that says what to do. It covers these cases:
+
+| Case | What the message says |
+|---|---|
+| No API key | How to pass one, and where to get a free key |
+| Key with a space, line break or control character | That no request was made and the API key needs fixing. The API key is not repeated. |
+| API key rejected (401) | Check the API key |
+| Plan gate (403 `upgrade_required`) | Which plan the data needs, plus the plan list. It also says when a FREE API key has used its 20 free history calls for the month. |
+| Any other 403, such as a firewall page | That the request was refused and it is not a plan limit |
+| Unknown id, or no data for it (404) | No data found for that request |
+| Ambiguous name (400) | The candidate names, so the model can retry with one |
+| Doubles-team id to `player_stats` (400) | That stats cover singles only, so query each player's own id |
+| Rate limit (429) | One of the three shapes below |
+| Network error, timeout, 5xx, or anything else | `Request failed:` and the reason, with the API key cut out |
+| An answer the tool's `outputSchema` cannot hold | `Request failed:` and the field that was wrong |
+
+`check_api_status` works differently, because its job is to diagnose. It returns `ok: true`
+whenever the API answered its health check:
+
+- With no API key, it reports `has_key: false`.
+- With a rejected or malformed API key, it reports `tier: null` and says what is wrong.
+- Otherwise it reads the plan from `GET /usage`, which does not count against the quota. On a
+  server without that endpoint it probes the history, events and analysis endpoints instead.
+
+It returns `ok: false` and `reachable: false` when the health check fails or does not answer
+with JSON. Sometimes the health check works but the plan check hits a rate limit or a server
+error. Then it returns `ok: false` and `reachable: true`, with the message any other tool would
+give.
+
+A plan gate as an error makes a model retry or give up. As a value, the model passes the upgrade
+path to the user, who is the only one who can act on it:
 
 ```ts
 {
   ok: false,
-  message: 'This data requires the ULTRA plan, and the configured API key is on a lower tier. …'
+  message: 'This data requires the ULTRA plan, and the configured API key is on a lower tier. ...'
 }
 ```
 
-This is deliberate. Marking a tier wall as an error makes models retry it or abandon the task; as a
-value, the model relays the upgrade path to the user — the only person who can act on it.
+The three 429 shapes need different reactions, so the messages tell them apart:
 
-The three 429 shapes are told apart, because each has a different correct reaction:
+1. Per minute. The client has already retried, honouring `Retry-After`. The message gives the
+   wait in seconds when the API sent one.
+2. Daily quota. The message gives the exact `resets_at` instant from the response. It follows
+   the service's local midnight. Retrying before then cannot work.
+3. `abuse_throttled`. A block of about 24 hours for clients that kept sending requests through
+   429s. The message says not to retry and to fix the retry loop. It gives the resume time when
+   the response has a valid `retry_at_epoch`. When that value is missing or malformed, the
+   message leaves the time out.
 
-- **per-minute** — wait `Retry-After` seconds and go again;
-- **daily quota** — the message carries the exact `resets_at` instant the allowance returns
-  (derived from the service's local midnight), so the model stops retrying into a wall;
-- **`abuse_throttled`** — a ~24-hour block for clients that kept hammering through 429s. The
-  message names the resume time and tells the model to fix the retry loop, not to wait it out
-  request by request.
-
-Name-keyed tools (`get_h2h`, `get_archive_career`, `get_charting_player`) refuse an ambiguous name
-fragment rather than guessing — the result relays the candidate list so the model can retry with a
-specific name.
-
-Successful calls return `ok: true`, a human-readable `message`, and the structured data:
+A successful call returns `ok: true`, a readable `message` and the structured data:
 
 ```ts
 {
   ok: true,
-  message: '2 live match(es): …',
-  matches: [{ id: 101, tournament: 'Test Open', player1: 'Player One', score: '6-4 3-2', … }],
+  message: '2 live match(es): ...',
+  matches: [{ id: 101, tournament: 'Test Open', player1: 'Player One', score: '6-4 3-2', ... }],
 }
 ```
 
-Every tool declares an `outputSchema` describing exactly that shape. Note that the AI SDK does not
-validate tool output at runtime, so the schema is a contract this package's own test suite enforces,
-not one the SDK enforces for you.
+Every tool declares an `outputSchema` for that shape. The AI SDK does not check a result
+against it when the tool runs, only when an app reloads a saved chat with
+`validateUIMessages`. This package's tests parse every result with it.
 
 ## Also available
 
-The same 24 tools are available as an MCP server — [`livetennisapi-mcp`](https://github.com/livetennisapi/livetennisapi-mcp) —
-for Claude, Cursor and other MCP clients. The underlying REST/WebSocket client is
-[`livetennisapi`](https://github.com/livetennisapi/livetennisapi-js).
+The same 25 tools run as an MCP server for Claude, Cursor and other MCP clients:
+[`livetennisapi-mcp`](https://www.npmjs.com/package/livetennisapi-mcp). The REST and WebSocket
+client underneath is [`livetennisapi`](https://www.npmjs.com/package/livetennisapi).
 
 ## Development
 
 ```bash
 npm install
 npm run typecheck
-npm run build
-npm test          # builds, then runs both suites against a local stub — no network, no key
+npm test          # builds, then runs three suites against a local stub. No network, no key.
 ```
 
-`test/tools-output.mjs` drives all 24 tools twice — once with no key, once against a stub upstream —
-and parses every result through the tool's own `outputSchema`. `test/generate-text.mjs` runs a full
-`generateText` loop against a mock model, which is what proves the zod schemas survive conversion to
+`test/tools-output.mjs` runs all 25 tools twice, once with no key and once against a stub
+upstream. It parses every result with the tool's own `outputSchema`. `test/errors.mjs` sends
+each 429 shape (malformed bodies included), 401, 403, 404 and an ambiguous name. It also sends a
+doubles-team id, empty lists, an empty `player_stats` sample, a network error and a malformed key. `test/generate-text.mjs` runs a full `generateText` loop against a mock model. That proves the zod schemas survive conversion to
 JSON Schema on the way to a provider.
 
 ## Links
 
-- Docs: https://docs.livetennisapi.com
+- npm: https://www.npmjs.com/package/livetennisapi-ai
+- Guide: https://docs.livetennisapi.com/ai-sdk.html
+- API docs: https://docs.livetennisapi.com
+- Source and issues: https://github.com/livetennisapi/livetennisapi-ai
+- Live Tennis API: https://livetennisapi.com
 - Free API key: https://livetennisapi.com/subscribe/free
 - Discord: https://discord.gg/f8WUZHgDm6
-- GitHub org: https://github.com/livetennisapi
 
 ## License
 
@@ -189,4 +235,6 @@ MIT
 
 ## Affiliate program
 
-Know developers who need tennis data? The [affiliate program](https://affiliates.livetennisapi.com/program) pays 51% recurring commission for the life of every referred subscription — 30-day cookie, and the people you refer get 10% off.
+Know developers who need tennis data? The [affiliate program](https://affiliates.livetennisapi.com/program)
+pays 51% recurring commission for the life of every referred subscription. The cookie lasts 30
+days, and the people you refer get 10% off.
