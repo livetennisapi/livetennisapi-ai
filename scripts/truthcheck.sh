@@ -28,7 +28,6 @@ forbid '[Ff]ree[^.]{0,60}\b1[,.]?000\b[^0-9]{0,12}(/|per )[ ]?day' 'FREE paired 
 # Wrong canonical URLs / identities / reset story.
 forbid 'livetennisapi\.com/docs' 'wrong docs URL — it is https://docs.livetennisapi.com'
 forbid 'bensynapse' 'personal identity in repo metadata — use the livetennisapi org'
-forbid 'github\.com/livetennisapi' 'the GitHub org is gone. Link the npm page, docs.livetennisapi.com or the GitLab mirror'
 forbid 'midnight UTC' 'daily quota does NOT reset at midnight UTC — the 429 body carries the exact resets_at instant'
 
 # If the repo states quotas at all, the current FREE cap and docs URL must be present.

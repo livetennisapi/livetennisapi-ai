@@ -385,7 +385,7 @@ export function createContext(options: LiveTennisToolOptions = {}): Context {
       return scrub(
         fail(
           `Request failed: the API answered, but ${where} was not in the expected shape. ` +
-            'Retrying will not help. Report it at https://gitlab.com/livetennisapi/livetennisapi-ai/-/issues',
+            'Retrying will not help. Report it at https://github.com/livetennisapi/livetennisapi-ai/issues',
         ),
       );
     }

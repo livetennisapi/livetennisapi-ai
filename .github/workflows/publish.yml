@@ -49,10 +49,6 @@ jobs:
 
       - run: npm install -g npm@latest
 
-      # No --provenance: package.json names the GitLab mirror as the repository,
-      # and npm rejects provenance from a GitHub workflow for a package whose
-      # repository is elsewhere. While the GitHub org is suspended, releases are
-      # published by hand from a workstation with `npm publish --access public`.
-      - run: npm publish --access public
+      - run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

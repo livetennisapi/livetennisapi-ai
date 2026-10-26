@@ -34,10 +34,10 @@
   "homepage": "https://docs.livetennisapi.com/ai-sdk.html",
   "repository": {
     "type": "git",
-    "url": "git+https://gitlab.com/livetennisapi/livetennisapi-ai.git"
+    "url": "git+https://github.com/livetennisapi/livetennisapi-ai.git"
   },
   "bugs": {
-    "url": "https://gitlab.com/livetennisapi/livetennisapi-ai/-/issues"
+    "url": "https://github.com/livetennisapi/livetennisapi-ai/issues"
   },
   "license": "MIT",
   "author": {
@@ -91,7 +91,8 @@
     "typescript": "^5.5.0"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   },
   "overrides": {
     "tsup": {

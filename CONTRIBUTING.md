@@ -37,14 +37,14 @@ Three constraints are not up for negotiation:
    result the model can read and act on. It names the tier a gated endpoint
    needs.
 2. **Tool names and descriptions match the MCP server**,
-   [livetennisapi-mcp](https://gitlab.com/livetennisapi/livetennisapi-mcp).
+   [livetennisapi-mcp](https://github.com/livetennisapi/livetennisapi-mcp).
    A test checks names, descriptions and parameter names when the server is
    built next to this repo, or when `LIVETENNISAPI_MCP_ENTRY` points at a
    build's `dist/index.js`. If you change a name or description here, change
    it there too.
 3. **Never retry a non-429 4xx.** A bad key or an unentitled tier cannot start
    working, and retrying only burns the caller's rate limit. (Inherited from
-   the underlying [`livetennisapi`](https://gitlab.com/livetennisapi/livetennisapi-js)
+   the underlying [`livetennisapi`](https://github.com/livetennisapi/livetennisapi-js)
    client. Keep the behaviour identical.)
 
 ## Reporting a spec mismatch
@@ -53,4 +53,4 @@ If the API returns something these tools don't expect, that's the most
 valuable bug report there is. Include the endpoint, the request, and the raw
 response. The [OpenAPI spec](https://docs.livetennisapi.com/openapi.json) is the
 source of truth. If the spec and the API disagree, the spec gets fixed.
-Open issues at https://gitlab.com/livetennisapi/livetennisapi-ai/-/issues.
+Open issues at https://github.com/livetennisapi/livetennisapi-ai/issues.

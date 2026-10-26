@@ -3,6 +3,17 @@
 All notable changes are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- The GitHub organisation is public again, so GitHub is the home of this package once more.
+  `repository` and `bugs` in package.json, the README, CONTRIBUTING and the shape-error message
+  in `src/tools.ts` link https://github.com/livetennisapi/livetennisapi-ai. The GitLab project
+  stays as a mirror.
+- Releases publish from the GitHub workflow with provenance again, and `publishConfig` sets
+  `provenance: true`. npm 1.2.1 and 1.3.0 still name GitLab in their metadata. The next release
+  replaces them.
+
 ## [1.3.0] (2026-10-22)
 
 ### Added

@@ -224,7 +224,7 @@ JSON Schema on the way to a provider.
 - npm: https://www.npmjs.com/package/livetennisapi-ai
 - Guide: https://docs.livetennisapi.com/ai-sdk.html
 - API docs: https://docs.livetennisapi.com
-- Source and issues: https://gitlab.com/livetennisapi/livetennisapi-ai
+- Source and issues: https://github.com/livetennisapi/livetennisapi-ai
 - Live Tennis API: https://livetennisapi.com
 - Free API key: https://livetennisapi.com/subscribe/free
 - Discord: https://discord.gg/f8WUZHgDm6
