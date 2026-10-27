@@ -3,6 +3,19 @@
 All notable changes are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+- `zod` moves from 3.25.76 to 4.6.7. There is no 3.x release that fixes GHSA-mrhx-c7xc-m3w5, so
+  this is the major bump. In `src/tools.ts` every `z.record(value)` is now `z.record(z.string(), value)`,
+  and the guard takes `z.ZodType<T, unknown>`. Nothing else changed. The 25 tool names, descriptions,
+  parameters and result shapes are the same, and the published type declarations never named zod.
+  The only differences in the JSON Schema the AI SDK generates are safe-integer bounds on
+  `.int()` parameters and a `propertyNames: { type: "string" }` entry on record outputs.
+- The `ai` development copy moves to 7.0.155 within the same `^7.0.0` range. Its earlier
+  `@ai-sdk/provider-utils` dropped a record's value schema when converting a zod 4 schema, and
+  5.0.70 keeps it. The peer range for users is unchanged.
+
 ## [1.3.1] (2026-10-26)
 
 ### Changed
