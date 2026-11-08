@@ -77,15 +77,15 @@
     "prepare": "npm run build"
   },
   "dependencies": {
-    "livetennisapi": "^1.10.0",
+    "livetennisapi": "^1.10.2",
     "zod": "^4.6.7"
   },
   "peerDependencies": {
-    "ai": "^7.0.0"
+    "ai": "^7.0.163"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
-    "ai": "^7.0.0",
+    "ai": "^7.0.163",
     "esbuild": "^0.28.2",
     "tsup": "^8.0.0",
     "typescript": "^5.5.0"
