@@ -84,7 +84,7 @@
     "ai": "^7.0.163"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.6.6",
     "ai": "^7.0.163",
     "esbuild": "^0.28.2",
     "tsup": "^9.0.0",
